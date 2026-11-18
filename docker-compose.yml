@@ -1,0 +1,15 @@
+services:
+  routine-tracker:
+    build: .
+    container_name: routine-tracker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_PATH: /app/data/routine-tracker.sqlite
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data

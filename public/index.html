@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f4f8">
+  <meta name="description" content="A calm, thoughtful space to keep your routines moving.">
+  <title>Routine — Make room for what matters</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#dashboard" aria-label="Routine home">
+        <span class="brand-mark"><span></span><span></span><span></span></span>
+        <span class="brand-name">routine<span class="brand-period">.</span></span>
+      </a>
+
+      <div class="workspace-label">WORKSPACE</div>
+      <nav class="main-nav" aria-label="Main navigation">
+        <button class="nav-item active" data-page="dashboard"><span class="nav-icon">◫</span><span>Overview</span><span class="nav-indicator"></span></button>
+        <button class="nav-item" data-page="calendar"><span class="nav-icon">▦</span><span>Calendar</span></button>
+        <button class="nav-item" data-page="routines"><span class="nav-icon">◉</span><span>All routines</span><span class="nav-count" id="navRoutineCount">0</span></button>
+        <button class="nav-item" data-page="history"><span class="nav-icon">↗</span><span>Activity</span></button>
+      </nav>
+
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-section-heading">YOUR SPACE</div>
+      <div class="sidebar-tip">
+        <div class="tip-orbit"><span>✦</span></div>
+        <div class="tip-title">Small steps, often.</div>
+        <p>Consistency is built one thoughtful check-in at a time.</p>
+      </div>
+
+      <div class="sidebar-bottom">
+        <button class="nav-item settings-nav" data-page="settings"><span class="nav-icon">⚙</span><span>Settings & sync</span></button>
+        <div class="profile-mini" id="sidebarProfile">
+          <div class="avatar" id="sidebarAvatar">Y</div>
+          <div class="profile-copy"><strong id="sidebarName">Your space</strong><small id="sidebarEmail">Local workspace</small></div>
+          <span class="profile-more">···</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div class="breadcrumb"><span>My space</span><span class="crumb-slash">/</span><strong id="breadcrumbCurrent">Overview</strong></div>
+        <div class="topbar-actions">
+          <div class="sync-indicator" id="syncIndicator"><span class="sync-dot"></span><span id="syncText">Saved on this device</span></div>
+          <button class="icon-button mobile-menu" id="mobileMenuButton" aria-label="Open menu">☰</button>
+          <button class="top-avatar" id="topAvatar" title="Account">Y</button>
+        </div>
+      </header>
+
+      <section class="page-view active" id="page-dashboard">
+        <div class="welcome-row">
+          <div>
+            <div class="eyebrow" id="todayLabel">YOUR DAILY RHYTHM</div>
+            <h1 id="welcomeTitle">Make room for <em>what matters.</em></h1>
+            <p class="page-subtitle">A little progress, a little more peace of mind.</p>
+          </div>
+          <button class="primary-button" id="newRoutineButton"><span class="button-plus">＋</span> New routine</button>
+        </div>
+
+        <div class="hero-panel">
+          <div class="hero-panel-copy">
+            <div class="hero-kicker"><span class="sparkle">✦</span> YOUR MOMENTUM</div>
+            <h2>Build a rhythm<br>that feels like <i>you.</i></h2>
+            <p>Keep the promises you make to yourself. The little ones count, too.</p>
+            <button class="text-button" data-go-page="routines">Explore your routines <span>↗</span></button>
+          </div>
+          <div class="hero-art" aria-hidden="true">
+            <div class="art-sun"></div><div class="art-ring art-ring-one"></div><div class="art-ring art-ring-two"></div>
+            <div class="art-leaf leaf-one"></div><div class="art-leaf leaf-two"></div><div class="art-leaf leaf-three"></div>
+            <div class="art-orbit-dot dot-one"></div><div class="art-orbit-dot dot-two"></div>
+            <div class="art-note">show up<br>for yourself<span>✧</span></div>
+          </div>
+          <div class="hero-bottom-line"><span>ONE DAY AT A TIME</span><span>✦</span><span>YOUR OWN PACE</span></div>
+        </div>
+
+        <div class="stats-grid" id="statsGrid">
+          <article class="stat-card stat-due"><div class="stat-top"><span>On your list</span><span class="stat-icon">◷</span></div><div class="stat-value" id="statDue">0</div><div class="stat-foot">Need a little attention</div></article>
+          <article class="stat-card stat-done"><div class="stat-top"><span>Done this month</span><span class="stat-icon">✓</span></div><div class="stat-value" id="statDone">0</div><div class="stat-foot">Every check-in counts</div></article>
+          <article class="stat-card stat-target"><div class="stat-top"><span>Targets reached</span><span class="stat-icon">✦</span></div><div class="stat-value" id="statTargets">0</div><div class="stat-foot">Frequency goals met</div></article>
+          <article class="stat-card stat-total"><div class="stat-top"><span>Your routines</span><span class="stat-icon">◌</span></div><div class="stat-value" id="statRoutines">0</div><div class="stat-foot">A routine for what matters</div></article>
+        </div>
+
+        <div class="section-heading-row">
+          <div><div class="eyebrow">STAY IN YOUR FLOW</div><h2>My checklist <span class="heading-count" id="checklistCount">0</span></h2></div>
+          <button class="subtle-button" data-go-page="routines">View all routines <span>→</span></button>
+        </div>
+        <div class="checklist-list" id="checklistList"></div>
+
+        <div class="section-heading-row routines-heading-row">
+          <div><div class="eyebrow">THE BIG PICTURE</div><h2>Your routines</h2></div>
+          <button class="subtle-button" data-go-page="routines">Manage routines <span>→</span></button>
+        </div>
+        <div class="routine-grid" id="dashboardRoutineGrid"></div>
+        <div class="bottom-note"><span class="note-star">✳</span><span>Progress isn't always a straight line. Keep showing up.</span><span class="note-line"></span></div>
+      </section>
+
+      <section class="page-view" id="page-calendar">
+        <div class="page-heading-row">
+          <div><div class="eyebrow">SEE THE SHAPE OF YOUR DAYS</div><h1>Your calendar</h1><p class="page-subtitle">Your routines and Google Calendar, together in one view.</p></div>
+          <button class="primary-button" id="calendarNewButton"><span class="button-plus">＋</span> New routine</button>
+        </div>
+        <div class="calendar-toolbar">
+          <div class="calendar-month-title"><button class="icon-button" id="calendarPrev" aria-label="Previous month">←</button><h2 id="calendarMonthTitle">Month 2026</h2><button class="icon-button" id="calendarNext" aria-label="Next month">→</button></div>
+          <div class="calendar-legend"><span><i class="legend-dot due-dot"></i>Routine due</span><span><i class="legend-dot done-dot"></i>Completed</span><span><i class="legend-dot google-dot"></i>Google event</span></div>
+        </div>
+        <div class="calendar-card">
+          <div class="calendar-weekdays"><span>MON</span><span>TUE</span><span>WED</span><span>THU</span><span>FRI</span><span>SAT</span><span>SUN</span></div>
+          <div class="calendar-grid" id="calendarGrid"></div>
+        </div>
+        <div class="calendar-footnote" id="calendarFootnote">Calendar updates automatically when Google is connected.</div>
+      </section>
+
+      <section class="page-view" id="page-routines">
+        <div class="page-heading-row">
+          <div><div class="eyebrow">YOUR PERSONAL SYSTEM</div><h1>All routines</h1><p class="page-subtitle">A gentle structure for the things you want to keep doing.</p></div>
+          <button class="primary-button" id="routinesNewButton"><span class="button-plus">＋</span> New routine</button>
+        </div>
+        <div class="filter-row"><div class="filter-pills" id="routineFilters"><button class="filter-pill active" data-filter="all">All routines</button><button class="filter-pill" data-filter="frequency">Frequency</button><button class="filter-pill" data-filter="interval">Repeat after</button></div><span class="result-count" id="routineResultCount">0 routines</span></div>
+        <div class="routine-grid all-routines-grid" id="allRoutineGrid"></div>
+      </section>
+
+      <section class="page-view" id="page-history">
+        <div class="page-heading-row"><div><div class="eyebrow">LOOK HOW FAR YOU'VE COME</div><h1>Your activity</h1><p class="page-subtitle">Every completed routine leaves a little trace of progress.</p></div></div>
+        <div class="history-card"><div class="history-card-header"><div><h2>Recent check-ins</h2><p>Your latest routine completions</p></div><span class="history-spark">✧</span></div><div id="historyList" class="history-list"></div></div>
+      </section>
+
+      <section class="page-view" id="page-settings">
+        <div class="page-heading-row"><div><div class="eyebrow">MAKE IT YOURS</div><h1>Settings & sync</h1><p class="page-subtitle">Your browser, your Google account, your own routine space.</p></div></div>
+        <div class="settings-layout">
+          <div class="settings-main">
+            <article class="settings-card google-settings-card">
+              <div class="settings-card-top"><div class="settings-icon google-icon">G</div><div><h2>Google account</h2><p>Connect the Google account used by this browser.</p></div><span class="connection-status" id="googleStatusPill">Not connected</span></div>
+              <div class="connected-account" id="connectedAccount" hidden></div>
+              <div class="settings-explainer">Your Google account is attached to this browser's secure server session. Another browser can connect a different Google account without mixing its routines with this one.</div>
+              <div class="settings-actions"><a class="primary-button" id="googleConnectButton" href="/auth/google">Connect Google <span>↗</span></a><button class="secondary-button" id="googleSwitchButton" hidden>Switch account</button><button class="quiet-danger-button" id="googleUnlinkButton" hidden>Sign out on this browser</button></div>
+            </article>
+            <article class="settings-card">
+              <div class="settings-card-top"><div class="settings-icon drive-icon">↥</div><div><h2>Google Drive backup</h2><p>Keep a copy of your routines and check-in history.</p></div><span class="small-status" id="driveStatus">Waiting for Google</span></div>
+              <div class="drive-file-row"><div class="file-mark">JSON</div><div><strong>Routine Tracker Backup.json</strong><small>Saved in your Google Drive · My Drive</small></div><span class="file-lock">↗</span></div>
+              <div class="settings-actions"><button class="primary-button" id="driveSyncButton" disabled>Sync to Drive <span>↥</span></button><button class="secondary-button" id="driveRestoreButton" disabled>Restore from Drive</button></div>
+              <p class="settings-hint">Changes are backed up automatically after a short pause. Restore merges saved items into this workspace; it doesn't delete your current routines.</p>
+            </article>
+            <article class="settings-card">
+              <div class="settings-card-top"><div class="settings-icon calendar-icon">▦</div><div><h2>Google Calendar</h2><p>Show your Google events alongside routine due dates.</p></div><span class="small-status" id="calendarStatus">Not connected</span></div>
+              <div class="calendar-sync-info"><span class="pulse-indicator"></span><span id="calendarSyncText">Connect Google to start syncing your primary calendar.</span></div>
+              <div class="settings-actions"><button class="secondary-button" id="calendarSyncButton" disabled>Refresh calendar <span>↻</span></button><button class="text-only-button" data-go-page="calendar">Open calendar <span>→</span></button></div>
+            </article>
+          </div>
+          <aside class="settings-aside">
+            <div class="privacy-card"><div class="privacy-illustration">⌑</div><div class="eyebrow">PRIVATE BY DESIGN</div><h3>Your tokens stay<br>on the server.</h3><p>Google access and refresh tokens are encrypted in the server database. The browser receives only a secure session cookie.</p><div class="privacy-divider"></div><div class="privacy-check">✓ <span>HTTP-only session cookie</span></div><div class="privacy-check">✓ <span>Encrypted Google tokens</span></div><div class="privacy-check">✓ <span>Separate browser sessions</span></div></div>
+            <div class="local-data-note"><strong>Local-first storage</strong><p>Your routine data is stored in the server's SQLite database. Keep the <code>data</code> folder when moving the app to another machine or Oracle Cloud.</p></div>
+          </aside>
+        </div>
+      </section>
+
+      <footer class="app-footer"><span>routine<span class="brand-period">.</span> <small>Make room for what matters.</small></span><span>Made for your everyday.</span></footer>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="routineModal" hidden>
+    <div class="routine-modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-header"><div><div class="eyebrow">MAKE IT A HABIT</div><h2 id="modalTitle">Create a routine</h2><p>Give something important a place in your day.</p></div><button class="modal-close" id="closeRoutineModal" aria-label="Close">×</button></div>
+      <form id="routineForm">
+        <input type="hidden" id="routineId">
+        <label class="field-label" for="routineTitle">Routine name</label>
+        <input class="text-input" id="routineTitle" maxlength="120" placeholder="e.g. Apply aloe vera" required>
+        <label class="field-label" for="routineNotes">A little note <span>OPTIONAL</span></label>
+        <textarea class="text-input notes-input" id="routineNotes" maxlength="1200" placeholder="Anything you want to remember about this routine..."></textarea>
+        <div class="field-label">How does it repeat?</div>
+        <div class="type-switch" id="typeSwitch"><button type="button" class="type-option active" data-type="frequency"><span>↻</span><strong>Frequency target</strong><small>A number of times per period</small></button><button type="button" class="type-option" data-type="interval"><span>◷</span><strong>After an interval</strong><small>Next one after you complete it</small></button></div>
+
+        <div id="frequencyFields" class="rule-fields">
+          <div class="field-label">How many times?</div>
+          <div class="inline-fields count-fields"><div><label for="minCount">Minimum</label><input class="text-input" type="number" id="minCount" min="1" max="100" value="2"></div><span class="range-dash">to</span><div><label for="maxCount">Maximum</label><input class="text-input" type="number" id="maxCount" min="1" max="100" value="3"></div></div>
+          <div class="inline-fields period-fields"><div><label for="periodValue">Every</label><input class="text-input" type="number" id="periodValue" min="1" max="365" value="1"></div><div><label for="periodUnit">Period</label><select class="text-input" id="periodUnit"><option value="weeks">Week(s)</option><option value="days">Day(s)</option><option value="months">Month(s)</option></select></div></div>
+          <div class="field-hint">For example, 2–3 times every 1 week. Your progress resets when the next period begins.</div>
+          <label class="field-label" for="startAt">Start tracking from</label><input class="text-input" type="date" id="startAt">
+        </div>
+
+        <div id="intervalFields" class="rule-fields" hidden>
+          <div class="field-label">Repeat after</div>
+          <div class="inline-fields period-fields"><div><label for="intervalValue">Every</label><input class="text-input" type="number" id="intervalValue" min="1" max="3650" value="2"></div><div><label for="intervalUnit">Period</label><select class="text-input" id="intervalUnit"><option value="weeks">Week(s)</option><option value="days">Day(s)</option><option value="months">Month(s)</option><option value="years">Year(s)</option></select></div></div>
+          <label class="check-line"><input type="checkbox" id="hasLastDone" checked><span>I have already completed this routine</span></label>
+          <div id="lastDoneWrap"><label class="field-label" for="lastCompletedAt">Last completed on</label><input class="text-input" type="date" id="lastCompletedAt"></div>
+          <div id="firstDueWrap" hidden><label class="field-label" for="firstDueAt">First due date</label><input class="text-input" type="date" id="firstDueAt"></div>
+          <div class="field-hint">The next date is always calculated from the day you actually mark it complete—even when it is late.</div>
+        </div>
+
+        <div class="field-label color-field-label">Choose a mood</div><div class="color-options" id="colorOptions"><button type="button" class="color-choice lavender selected" data-color="lavender" aria-label="Lavender"></button><button type="button" class="color-choice mint" data-color="mint" aria-label="Mint"></button><button type="button" class="color-choice peach" data-color="peach" aria-label="Peach"></button><button type="button" class="color-choice blue" data-color="blue" aria-label="Blue"></button><button type="button" class="color-choice rose" data-color="rose" aria-label="Rose"></button><button type="button" class="color-choice gold" data-color="gold" aria-label="Gold"></button></div>
+        <div class="modal-footer"><button type="button" class="secondary-button" id="cancelRoutineButton">Cancel</button><button type="submit" class="primary-button" id="saveRoutineButton">Save routine <span>→</span></button></div>
+      </form>
+    </div>
+  </div>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

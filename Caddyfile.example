@@ -1,0 +1,9 @@
+# Optional Caddy reverse-proxy example for an Oracle Cloud VM.
+# Replace routines.example.com with a domain pointing to your VM public IP.
+# Set BASE_URL=https://routines.example.com, GOOGLE_REDIRECT_URI=https://routines.example.com/auth/google/callback,
+# and COOKIE_SECURE=true in .env before using this configuration.
+
+routines.example.com {
+    encode gzip zstd
+    reverse_proxy routine-tracker:3000
+}
