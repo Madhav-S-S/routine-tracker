@@ -19,8 +19,8 @@
       </a>
 
       <nav class="main-nav" aria-label="Main navigation">
-        <button class="nav-item active" data-page="dashboard"><span class="nav-icon">◫</span><span>Overview</span><span class="nav-indicator"></span></button>
-        <button class="nav-item" data-page="calendar"><span class="nav-icon">▦</span><span>Calendar</span></button>
+        <button class="nav-item active" data-page="dashboard"><span class="nav-icon dashboard-nav-icon" aria-hidden="true">✓</span><span>Dashboard</span><span class="nav-indicator"></span></button>
+        <button class="nav-item" data-page="calendar"><span class="nav-icon calendar-nav-icon" aria-hidden="true"><b>31</b></span><span>Calendar</span></button>
         <button class="nav-item" data-page="routines"><span class="nav-icon">◉</span><span>All routines</span><span class="nav-count" id="navRoutineCount">0</span></button>
         <button class="nav-item" data-page="history"><span class="nav-icon">↗</span><span>Activity</span></button>
       </nav>
@@ -43,7 +43,7 @@
         <button class="mobile-profile-button" id="mobileProfileButton" type="button" aria-label="Open profile settings">
           <span class="top-avatar" id="mobileHeaderAvatar">Y</span>
         </button>
-        <div class="breadcrumb"><strong id="breadcrumbCurrent">Overview</strong></div>
+        <div class="breadcrumb"><strong id="breadcrumbCurrent">Dashboard</strong></div>
         <div class="topbar-actions">
           <div class="sync-indicator" id="syncIndicator"><span class="sync-dot"></span><span id="syncText">Saved on this server</span></div>
         </div>
@@ -64,7 +64,7 @@
         </div>
 
         <div class="section-heading-row routines-heading-row">
-          <div><div class="eyebrow">THE BIG PICTURE</div><h2>Your routines</h2></div>
+          <div><h2>Your routines</h2></div>
           <button class="subtle-button" data-go-page="routines">Manage routines <span>→</span></button>
         </div>
         <div class="routine-grid" id="dashboardRoutineGrid"></div>
@@ -217,7 +217,7 @@
       <label class="field-label" for="calendarActionDate" id="calendarActionDateLabel">Scheduled date</label>
       <input class="text-input date-keyboard" type="text" id="calendarActionDate" data-date-field inputmode="numeric" autocomplete="off" placeholder="DD-MM-YYYY" aria-label="Task or completion date">
       <div class="calendar-event-actions">
-        <button class="primary-button" id="calendarEventComplete" type="button">Mark complete</button>
+        <button class="primary-button calendar-complete-icon-button" id="calendarEventComplete" type="button" aria-label="Mark complete" title="Mark complete"><span aria-hidden="true">✓</span></button>
         <button class="secondary-button" id="calendarEventSaveDate" type="button">Save date</button>
         <button class="quiet-danger-button" id="calendarEventDelete" type="button">Delete activity</button>
         <a class="text-only-button" id="calendarEventOpen" href="#" target="_blank" rel="noopener" hidden>Open Google event ↗</a>
@@ -226,8 +226,8 @@
   </div>
 
   <nav class="mobile-bottom-nav" aria-label="Mobile navigation">
-    <button class="mobile-nav-item active" data-page="dashboard"><span>◫</span><small>Home</small></button>
-    <button class="mobile-nav-item" data-page="calendar"><span>▦</span><small>Calendar</small></button>
+    <button class="mobile-nav-item active" data-page="dashboard"><span class="dashboard-nav-icon" aria-hidden="true">✓</span><small>Dashboard</small></button>
+    <button class="mobile-nav-item" data-page="calendar"><span class="calendar-nav-icon" aria-hidden="true"><b>31</b></span><small>Calendar</small></button>
     <button class="mobile-nav-item" data-page="routines"><span>◉</span><small>Routines</small></button>
     <button class="mobile-nav-item" data-page="history"><span>↗</span><small>Activity</small></button>
   </nav>

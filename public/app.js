@@ -332,7 +332,7 @@ function routineCard(routine) {
   const canComplete = isFrequency ? !routine.maximumReached : Boolean(routine.isDue);
   const statusGood = isFrequency ? routine.minimumReached : !routine.isDue;
   const status = routineStatusText(routine);
-  const actionLabel = completed ? 'All done' : isFrequency ? (routine.checkinAvailable ? 'Tick' : 'Tick early') : (routine.isDue ? 'Tick' : 'Not due yet');
+  const actionTitle = completed ? 'Target complete' : !canComplete ? 'Not due yet' : isFrequency && !routine.checkinAvailable ? 'Log an early completion' : 'Mark complete';
   return `
     <article class="routine-card custom-routine-color" style="--routine-accent:${accent};--routine-icon-color:${iconTint}" data-routine-card="${escapeHtml(routine.id)}">
       <div class="routine-top">
@@ -343,11 +343,11 @@ function routineCard(routine) {
       </div>
       <div class="routine-meta"><span>${escapeHtml(isFrequency ? periodLabel(routine) : routine.cadenceLabel)}</span><strong>${escapeHtml(isFrequency ? `${routine.completedCount}/${routine.max_count}` : routine.daysUntilDue < 0 ? `${Math.abs(routine.daysUntilDue)}d late` : routine.daysUntilDue === 0 ? 'Today' : routine.daysUntilDue > 0 ? `${routine.daysUntilDue}d` : '—')}</strong></div>
       <div class="progress-track"><div class="progress-fill" style="width:${isFrequency ? progress : (routine.isDue ? 100 : Math.max(8, Math.min(100, 100 - routine.daysUntilDue * 5)))}%"></div></div>
-      <div class="routine-card-footer"><span class="routine-status"><i class="status-dot ${statusGood ? 'good' : ''}"></i>${escapeHtml(status)}</span><button class="routine-action" type="button" data-action="complete" data-id="${escapeHtml(routine.id)}" ${!canComplete || completed ? 'disabled' : ''}>${actionLabel} ${completed ? '✓' : '→'}</button></div>
+      <div class="routine-card-footer"><span class="routine-status"><i class="status-dot ${statusGood ? 'good' : ''}"></i>${escapeHtml(status)}</span><button class="routine-action routine-tick-button" type="button" data-action="complete" data-id="${escapeHtml(routine.id)}" aria-label="${escapeHtml(actionTitle)}: ${escapeHtml(routine.title)}" title="${escapeHtml(actionTitle)}" ${!canComplete || completed ? 'disabled' : ''}><span aria-hidden="true">✓</span></button></div>
     </article>`;
 }
 function renderChecklist() {
-  const items = state.routines.filter((r) => r.type === 'frequency' ? r.checkinAvailable : r.isDue)
+  const items = state.routines.filter((r) => !r.taskSuppressed && (r.type === 'frequency' ? r.checkinAvailable : r.isDue))
     .sort((a, b) => (a.type === 'interval' ? 0 : 1) - (b.type === 'interval' ? 0 : 1) || (a.title || '').localeCompare(b.title || ''));
   $('#checklistCount').textContent = String(items.length);
   if (!items.length) {
@@ -414,7 +414,7 @@ function setPage(page) {
   state.activePage = page;
   $$('.page-view').forEach((view) => view.classList.toggle('active', view.id === `page-${page}`));
   $$('.nav-item[data-page], .mobile-nav-item[data-page]').forEach((button) => button.classList.toggle('active', button.dataset.page === page));
-  const label = ({ dashboard: 'Overview', calendar: 'Calendar', routines: 'All routines', history: 'Activity', settings: 'Settings & sync' })[page];
+  const label = ({ dashboard: 'Dashboard', calendar: 'Calendar', routines: 'All routines', history: 'Activity', settings: 'Settings & sync' })[page];
   $('#breadcrumbCurrent').textContent = label;
   $('#sidebar').classList.remove('open');
   $('#mobileMenuButton')?.setAttribute('aria-expanded', 'false');
@@ -536,7 +536,7 @@ async function loadHistory() {
     const data = await api('/api/history?limit=100');
     const rows = data.history || [];
     if (!rows.length) {
-      $('#historyList').innerHTML = '<div class="history-empty">Your completed routines will appear here. Tick off a routine to get started.</div>';
+      $('#historyList').innerHTML = '<div class="history-empty">Your completed routines will appear here. Complete a routine to get started.</div>';
       return;
     }
     $('#historyList').innerHTML = rows.map((row) => `<div class="history-entry"><div class="history-mark">✓</div><div class="history-entry-copy"><strong>${escapeHtml(row.title)}</strong><small>${escapeHtml(row.note || 'Routine completed')}</small></div><div class="history-date">${formatDate(row.completed_at, { day: 'numeric', month: 'short' })} · ${formatDate(row.completed_at, { hour: 'numeric', minute: '2-digit' })}</div><button class="history-delete" type="button" data-action="delete-activity" data-id="${escapeHtml(row.id)}" aria-label="Delete activity" title="Delete activity">×</button></div>`).join('');
@@ -710,9 +710,12 @@ function openCalendarEvent(event) {
   dateWrap.hidden = !canEditDate;
   $('#calendarEventComplete').hidden = !isDue;
   $('#calendarEventComplete').disabled = (isDue && event.available === false) || isGoogle;
-  $('#calendarEventComplete').textContent = event.kind === 'frequency' ? 'Tick now' : 'Mark complete';
+  $('#calendarEventComplete').innerHTML = '<span aria-hidden="true">✓</span>';
+  $('#calendarEventComplete').setAttribute('aria-label', 'Mark routine complete');
+  $('#calendarEventComplete').title = 'Mark complete';
   $('#calendarEventSaveDate').hidden = !canEditDate;
-  $('#calendarEventDelete').hidden = !isCompletion;
+  $('#calendarEventDelete').hidden = !(isCompletion || isDue);
+  $('#calendarEventDelete').textContent = isCompletion ? 'Delete activity' : 'Delete task';
   $('#calendarEventOpen').hidden = !isGoogle || !event.url;
   if (event.url) $('#calendarEventOpen').href = event.url;
   $('#calendarEventModal').hidden = false;
@@ -749,15 +752,25 @@ async function completeCalendarEvent() {
 }
 async function deleteCalendarActivity() {
   const event = state.selectedCalendarEvent;
-  if (!event?.completionId) return;
-  if (!confirm('Delete this completion from your activity and update routine progress?')) return;
+  if (!event) return;
+  const isCompletion = event.kind === 'completion' && event.completionId;
+  const isRoutineTask = ['due', 'frequency'].includes(event.kind) && event.routineId;
+  if (!isCompletion && !isRoutineTask) return;
+  const message = isCompletion
+    ? 'Delete this activity and its matching Google Task? This also updates routine progress.'
+    : 'Delete this scheduled task from the website and its matching Google Task? The routine itself will remain.';
+  if (!confirm(message)) return;
   try {
-    await api(`/api/history/${encodeURIComponent(event.completionId)}`, { method: 'DELETE' });
+    if (isCompletion) {
+      await api(`/api/history/${encodeURIComponent(event.completionId)}`, { method: 'DELETE' });
+    } else {
+      await api(`/api/routines/${encodeURIComponent(event.routineId)}/task`, { method: 'DELETE' });
+    }
     closeCalendarEvent();
     await loadBootstrap();
     await loadCalendar();
     await loadHistory();
-    toast('Activity deleted.');
+    toast(isCompletion ? 'Activity and its Google Task deleted.' : 'Task and its Google Task deleted.');
   } catch (error) { toast(error.message, 'error'); }
 }
 

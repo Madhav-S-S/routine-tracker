@@ -602,3 +602,69 @@ body { background: radial-gradient(ellipse at 12% 0%, rgba(116,80,185,.12), tran
 
 .calendar-day .day-select { border: 0; background: transparent; padding: 0; font: inherit; cursor: pointer; }
 .calendar-day .day-select:focus-visible { outline: 2px solid #b9a8ff; outline-offset: 2px; }
+
+
+/* Consistent icon-only completion buttons across routine cards and calendar dialogs. */
+.routine-action.routine-tick-button,
+.calendar-complete-icon-button {
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  flex: 0 0 36px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(176, 153, 255, .34);
+  border-radius: 12px;
+  background: linear-gradient(145deg, #8d72e8, #6754c9);
+  color: #fff;
+  box-shadow: 0 6px 16px rgba(112, 83, 205, .25);
+  font-size: 21px;
+  line-height: 1;
+  text-decoration: none;
+}
+.routine-action.routine-tick-button span,
+.calendar-complete-icon-button span { line-height: 1; transform: translateY(-.5px); }
+.routine-action.routine-tick-button:disabled { background: #243d34; border-color: #315b49; color: #8ed2ae; box-shadow: none; opacity: 1; }
+.routine-action.routine-tick-button:hover:not(:disabled),
+.calendar-complete-icon-button:hover { filter: brightness(1.12); transform: translateY(-1px); }
+.calendar-complete-icon-button { width: 42px; height: 42px; min-width: 42px; flex-basis: 42px; border-radius: 14px; }
+
+/* Dashboard and Calendar tabs use simple, recognizable symbols. */
+.dashboard-nav-icon {
+  display: inline-grid !important;
+  place-items: center;
+  width: 19px;
+  height: 19px;
+  border-radius: 6px;
+  background: rgba(142, 119, 232, .15);
+  color: #bbaaff !important;
+  font-size: 14px !important;
+  font-weight: 800;
+}
+.calendar-nav-icon {
+  width: 19px !important;
+  height: 20px;
+  display: inline-grid !important;
+  place-items: end center;
+  position: relative;
+  overflow: hidden;
+  border: 1px solid #7c8bb5;
+  border-radius: 4px;
+  background: #f4f5fb;
+  color: #34466d !important;
+  box-shadow: inset 0 3px 0 #f4f5fb;
+}
+.calendar-nav-icon::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto;
+  height: 6px;
+  background: linear-gradient(90deg, #4285f4 0 25%, #34a853 25% 50%, #fbbc04 50% 75%, #ea4335 75% 100%);
+}
+.calendar-nav-icon b { position: relative; z-index: 1; padding-bottom: 1px; font-size: 10px; line-height: 1; font-weight: 800; font-family: Arial, sans-serif; }
+.nav-item.active .calendar-nav-icon { color: #34466d !important; }
+.mobile-nav-item .dashboard-nav-icon { width: 21px; height: 21px; font-size: 15px !important; }
+.mobile-nav-item .calendar-nav-icon { width: 20px !important; height: 21px; }
+.mobile-bottom-nav { grid-template-columns: repeat(4, minmax(0, 1fr)) !important; }
+.calendar-event-actions .calendar-complete-icon-button { align-self: center; }

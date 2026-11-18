@@ -107,6 +107,13 @@ db.exec(`
     status TEXT NOT NULL DEFAULT 'needsAction', updated_at TEXT NOT NULL, completion_id TEXT,
     PRIMARY KEY(account_key, routine_id, slot_key)
   );
+  CREATE TABLE IF NOT EXISTS routine_task_suppressions (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+    slot_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, routine_id, slot_key)
+  );
   CREATE TABLE IF NOT EXISTS google_events (
     account_key TEXT NOT NULL REFERENCES google_accounts(account_key) ON DELETE CASCADE,
     event_id TEXT NOT NULL,
@@ -435,6 +442,28 @@ function isoDateOnly(value) {
   const d = new Date(value);
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
 }
+function routineTaskSlotKey(routine, item = null) {
+  if (routine.type === 'interval' && routine.next_due_at) {
+    return `${routine.linked_to_routine_id ? 'linked' : 'interval'}:${routine.next_due_at}`;
+  }
+  if (routine.type === 'frequency') {
+    const publicItem = item || publicRoutine(routine);
+    if (!publicItem.periodStart) return null;
+    return `frequency:${publicItem.periodStart}:${publicItem.completedCount}`;
+  }
+  return null;
+}
+function isRoutineTaskSuppressed(userId, routineId, slotKey) {
+  return Boolean(slotKey && db.prepare('SELECT 1 FROM routine_task_suppressions WHERE user_id=? AND routine_id=? AND slot_key=?').get(userId, routineId, slotKey));
+}
+async function deleteGoogleTask(accountKey, taskId) {
+  if (!accountKey || !taskId) return;
+  try {
+    await tasksApi(accountKey).tasks.delete({ tasklist: '@default', task: taskId });
+  } catch (error) {
+    if (Number(error.code || error.response?.status) !== 404) throw error;
+  }
+}
 const taskSyncLocks = new Set();
 async function syncRoutineTasks(userId, routines = listRoutines(userId)) {
   if (taskSyncLocks.has(userId)) return { skipped: true, reason: 'sync already running' };
@@ -443,6 +472,20 @@ async function syncRoutineTasks(userId, routines = listRoutines(userId)) {
   const account = getCurrentGoogleAccount(userId);
   if (!account) return { skipped: true };
   const tasks = tasksApi(account.account_key);
+  // Clean up Google Tasks left behind by routines archived before this version.
+  const archivedTasks = db.prepare(`SELECT gt.* FROM google_tasks gt
+    JOIN routines r ON r.id=gt.routine_id
+    WHERE gt.account_key=? AND r.user_id=? AND r.archived=1 AND gt.status<>'deleted'`)
+    .all(account.account_key, userId);
+  for (const oldTask of archivedTasks) {
+    try {
+      await deleteGoogleTask(account.account_key, oldTask.task_id);
+      db.prepare("UPDATE google_tasks SET status='deleted',updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
+        .run(nowIso(), account.account_key, oldTask.routine_id, oldTask.slot_key);
+    } catch (error) {
+      console.warn('Could not clean up a task belonging to an archived routine:', error.message);
+    }
+  }
   for (const routine of routines) {
     let dueDate = null;
     let slotKey = '';
@@ -451,13 +494,14 @@ async function syncRoutineTasks(userId, routines = listRoutines(userId)) {
       if (routine.linked_to_routine_id && routine.last_completed_at &&
           new Date(routine.last_completed_at).getTime() >= new Date(routine.next_due_at).getTime()) continue;
       dueDate = isoDateOnly(routine.next_due_at);
-      slotKey = `${routine.linked_to_routine_id ? 'linked' : 'interval'}:${routine.next_due_at}`;
+      slotKey = routineTaskSlotKey(routine);
     } else if (routine.type === 'frequency' && routine.checkinAvailable) {
-      // Create frequency tasks only when the next progressive check-in is actually unlocked.
+      // Create frequency tasks only when the next Progressive opportunity is visible.
       dueDate = isoDateOnly(nowIso());
-      slotKey = `frequency:${routine.periodStart}:${routine.completedCount}`;
+      slotKey = routineTaskSlotKey(routine);
     }
-    if (!dueDate) continue;
+    if (!dueDate || !slotKey) continue;
+    if (isRoutineTaskSuppressed(userId, routine.id, slotKey)) continue;
 
     let existing = db.prepare('SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=?')
       .get(account.account_key, routine.id, slotKey);
@@ -565,6 +609,8 @@ function publicRoutine(routine, now = new Date()) {
       item.cadenceLabel = `Every ${routine.interval_value} ${unitLabel(routine.interval_unit)}`;
     }
   }
+  item.taskSlotKey = routineTaskSlotKey(routine, item);
+  item.taskSuppressed = isRoutineTaskSuppressed(routine.user_id, routine.id, item.taskSlotKey);
   return item;
 }
 function listRoutines(userId, includeArchived = false) {
@@ -606,7 +652,7 @@ function statsFor(userId, routines) {
   monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
   const completedThisMonth = db.prepare('SELECT COUNT(*) AS n FROM completions WHERE user_id = ? AND completed_at >= ?')
     .get(userId, monthStart.toISOString()).n;
-  const dueCount = routines.filter((r) => r.type === 'interval' ? r.isDue : r.checkinAvailable).length;
+  const dueCount = routines.filter((r) => !r.taskSuppressed && (r.type === 'interval' ? r.isDue : r.checkinAvailable)).length;
   const targetsMet = routines.filter((r) => r.type === 'frequency' && r.minimumReached).length;
   return { routineCount: routines.length, completedThisMonth, dueCount, targetsMet };
 }
@@ -1036,13 +1082,66 @@ app.patch('/api/routines/:id', (req, res) => {
     res.json({ routine: publicRoutine(db.prepare('SELECT * FROM routines WHERE id = ?').get(existing.id)) });
   } catch (error) { res.status(400).json({ error: error.message }); }
 });
-app.delete('/api/routines/:id', (req, res) => {
-  const result = db.prepare('UPDATE routines SET archived = 1, updated_at = ? WHERE id = ? AND user_id = ?')
-    .run(nowIso(), req.params.id, req.userId);
-  if (!result.changes) return res.status(404).json({ error: 'Routine not found.' });
-  updateLinkedRoutineSchedules(req.userId, req.params.id);
-  queueDriveSync(req.userId);
-  res.json({ ok: true });
+app.delete('/api/routines/:id/task', async (req, res) => {
+  try {
+    const routine = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=? AND archived=0').get(req.params.id, req.userId);
+    if (!routine) return res.status(404).json({ error: 'Routine not found.' });
+    const item = publicRoutine(routine);
+    const slotKey = routineTaskSlotKey(routine, item);
+    if (!slotKey) return res.status(409).json({ error: 'There is no current task occurrence to delete.' });
+    const account = getCurrentGoogleAccount(req.userId);
+    const linkedTask = account
+      ? db.prepare('SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=?').get(account.account_key, routine.id, slotKey)
+      : null;
+    // Delete remotely first. If Google rejects the operation, keep the local
+    // checklist item visible so the two systems do not silently diverge.
+    if (linkedTask && linkedTask.status !== 'deleted') {
+      try { await deleteGoogleTask(account.account_key, linkedTask.task_id); }
+      catch (error) {
+        console.warn('Could not delete Google Task occurrence:', error.message);
+        return res.status(502).json({ error: 'Google could not delete this task. Reconnect Google Tasks and try again.' });
+      }
+      db.prepare("UPDATE google_tasks SET status='deleted',updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
+        .run(nowIso(), account.account_key, routine.id, slotKey);
+    }
+    db.prepare('INSERT OR IGNORE INTO routine_task_suppressions(user_id,routine_id,slot_key,created_at) VALUES(?,?,?,?)')
+      .run(req.userId, routine.id, slotKey, nowIso());
+    queueDriveSync(req.userId);
+    res.json({ ok: true, googleDeleted: Boolean(linkedTask) });
+  } catch (error) {
+    console.error('Task deletion failed:', error.message);
+    res.status(500).json({ error: 'Could not delete this task.' });
+  }
+});
+
+app.delete('/api/routines/:id', async (req, res) => {
+  try {
+    const routine = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=? AND archived=0').get(req.params.id, req.userId);
+    if (!routine) return res.status(404).json({ error: 'Routine not found.' });
+    const account = getCurrentGoogleAccount(req.userId);
+    const linkedTasks = account
+      ? db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status<>'deleted'").all(account.account_key, routine.id)
+      : [];
+    // Archive only after every Google Task has been removed successfully.
+    if (account) {
+      for (const task of linkedTasks) {
+        try { await deleteGoogleTask(account.account_key, task.task_id); }
+        catch (error) {
+          console.warn('Could not delete Google Task while archiving routine:', error.message);
+          return res.status(502).json({ error: 'The routine was not archived because Google could not delete one of its tasks. Reconnect Google Tasks and try again.' });
+        }
+      }
+      db.prepare("UPDATE google_tasks SET status='deleted',updated_at=? WHERE account_key=? AND routine_id=?")
+        .run(nowIso(), account.account_key, routine.id);
+    }
+    db.prepare('UPDATE routines SET archived=1,updated_at=? WHERE id=? AND user_id=?').run(nowIso(), routine.id, req.userId);
+    updateLinkedRoutineSchedules(req.userId, routine.id);
+    queueDriveSync(req.userId);
+    res.json({ ok: true, deletedGoogleTasks: linkedTasks.length });
+  } catch (error) {
+    console.error('Routine archive failed:', error.message);
+    res.status(500).json({ error: 'Could not archive this routine.' });
+  }
 });
 app.post('/api/routines/:id/complete', async (req, res) => {
   try {
@@ -1106,12 +1205,10 @@ app.delete('/api/history/:id', async (req, res) => {
   }
   if (linkedTask) {
     try {
-      await tasksApi(account.account_key).tasks.delete({ tasklist: '@default', task: linkedTask.task_id });
+      await deleteGoogleTask(account.account_key, linkedTask.task_id);
     } catch (error) {
-      if (Number(error.code || error.response?.status) !== 404) {
-        console.warn('Could not delete linked Google Task:', error.message);
-        return res.status(502).json({ error: 'The activity was not deleted because its Google Task could not be deleted. Check Google connection and try again.' });
-      }
+      console.warn('Could not delete linked Google Task:', error.message);
+      return res.status(502).json({ error: 'The activity was not deleted because its Google Task could not be deleted. Reconnect Google Tasks and try again.' });
     }
     db.prepare("UPDATE google_tasks SET status='deleted',completion_id=NULL,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
       .run(nowIso(), account.account_key, row.routine_id, linkedTask.slot_key);
@@ -1246,11 +1343,11 @@ app.get('/api/calendar', async (req, res) => {
     }
     const routines = listRoutines(req.userId);
     for (const r of routines) {
-      if (r.type === 'interval' && r.next_due_at && !(r.linked_to_routine_id && r.last_completed_at && new Date(r.last_completed_at) >= new Date(r.next_due_at))) {
+      if (r.type === 'interval' && r.next_due_at && !r.taskSuppressed && !(r.linked_to_routine_id && r.last_completed_at && new Date(r.last_completed_at) >= new Date(r.next_due_at))) {
         const due = new Date(r.next_due_at);
         if (due >= start && due < end) events.push({ id: `due_${r.id}`, title: `${r.title} · due`, start: r.next_due_at, allDay: true, kind: 'due', routineId: r.id, color: r.color, linked: Boolean(r.linked_to_routine_id), available: due.getTime() <= Date.now() });
       }
-      if (r.type === 'frequency' && r.checkinAvailable && !r.maximumReached) {
+      if (r.type === 'frequency' && r.checkinAvailable && !r.maximumReached && !r.taskSuppressed) {
         const opportunity = new Date(r.nextOpportunityAt || r.periodStart);
         if (opportunity >= start && opportunity < end) events.push({ id: `freq_${r.id}`, title: `${r.title} · task`, start: opportunity.toISOString(), allDay: true, kind: 'frequency', routineId: r.id, color: r.color, available: r.checkinAvailable });
       }
