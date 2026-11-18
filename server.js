@@ -19,11 +19,16 @@ const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `${BASE_URL}/auth/google
 const DB_PATH = path.resolve(process.env.DATABASE_PATH || './data/routine-tracker.sqlite');
 const COOKIE_SECURE = String(process.env.COOKIE_SECURE || 'false').toLowerCase() === 'true';
 const DRIVE_AUTO_SYNC = String(process.env.DRIVE_AUTO_SYNC || 'true').toLowerCase() !== 'false';
-const DRIVE_AUTO_SYNC_DELAY_MS = Number(process.env.DRIVE_AUTO_SYNC_DELAY_MS || 6000);
+const DRIVE_AUTO_SYNC_DELAY_MS = Math.max(15000, Number(process.env.DRIVE_AUTO_SYNC_DELAY_MS || 30000));
 const CALENDAR_SYNC_INTERVAL_MS = Number(process.env.CALENDAR_SYNC_INTERVAL_MS || 300000);
-const TASK_SYNC_INTERVAL_MS = Number(process.env.TASK_SYNC_INTERVAL_MS || 60000);
+const TASK_SYNC_INTERVAL_MS = Number(process.env.TASK_SYNC_INTERVAL_MS || 180000);
+const TASK_SYNC_BOOTSTRAP_COOLDOWN_MS = Math.max(30000, Number(process.env.TASK_SYNC_BOOTSTRAP_COOLDOWN_MS || 60000));
+// Routine dates are date-based, while Google reports task completion timestamps
+// as UTC instants. Use the user's local calendar date when computing the next
+// occurrence; configure APP_TIME_ZONE if the server owner uses another zone.
+const APP_TIME_ZONE = process.env.APP_TIME_ZONE || 'Asia/Kolkata';
 const SESSION_MAX_AGE = 1000 * 60 * 60 * 24 * 365;
-const APP_VERSION = '1.6.0';
+const APP_VERSION = '1.7.0';
 
 if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.includes('replace-with')) {
   throw new Error('Set SESSION_SECRET in your .env file before starting the app.');
@@ -138,6 +143,7 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_completions_user_date ON completions(user_id, completed_at);
   CREATE INDEX IF NOT EXISTS idx_completions_routine_date ON completions(routine_id, completed_at);
   CREATE INDEX IF NOT EXISTS idx_google_events_account_start ON google_events(account_key, start_at);
+  CREATE INDEX IF NOT EXISTS idx_google_tasks_account_id ON google_tasks(account_key, task_id);
   CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 `);
 
@@ -154,6 +160,9 @@ ensureColumn('routines', 'linked_offset_days', 'INTEGER NOT NULL DEFAULT -1');
 ensureColumn('routines', 'linked_completed_anchor', 'TEXT');
 ensureColumn('google_events', 'description', 'TEXT');
 ensureColumn('google_tasks', 'completion_id', 'TEXT');
+ensureColumn('google_tasks', 'remote_updated_at', 'TEXT');
+ensureColumn('google_tasks', 'legacy_probe_done', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('google_accounts', 'last_task_sync', 'TEXT');
 ensureColumn('routines', 'icon_name', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('routines', 'icon_color', "TEXT NOT NULL DEFAULT ''");
 
@@ -442,6 +451,22 @@ function isoDateOnly(value) {
   const d = new Date(value);
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
 }
+function routineDateOnly(value) {
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error('A valid completion date is required.');
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: APP_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(date);
+  const part = (type) => parts.find((item) => item.type === type)?.value;
+  return `${part('year')}-${part('month')}-${part('day')}`;
+}
+function routineDateAnchor(value) {
+  return new Date(`${routineDateOnly(value)}T00:00:00.000Z`);
+}
+function addRoutineIntervalFromCompletion(value, amount, unit) {
+  return addInterval(routineDateAnchor(value), amount, unit);
+}
 function routineTaskSlotKey(routine, item = null) {
   if (routine.type === 'interval' && routine.next_due_at) {
     return `${routine.linked_to_routine_id ? 'linked' : 'interval'}:${routine.next_due_at}`;
@@ -465,15 +490,222 @@ async function deleteGoogleTask(accountKey, taskId) {
   }
 }
 const taskSyncLocks = new Set();
-async function syncRoutineTasks(userId, routines = listRoutines(userId)) {
+
+// Pull changes made in Google Tasks/Calendar back into Routine Tracker.
+// The Tasks API requires both showCompleted and showHidden to return tasks
+// completed in Google's first-party Calendar/Tasks interfaces.
+function recalculateRoutineAfterGoogleTaskChange(userId, routineId) {
+  const routine = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=?').get(routineId, userId);
+  if (!routine) return;
+  const latest = db.prepare('SELECT completed_at FROM completions WHERE routine_id=? ORDER BY completed_at DESC LIMIT 1').get(routineId);
+  const lastCompletedAt = latest?.completed_at || null;
+
+  if (routine.type === 'interval' && !routine.linked_to_routine_id) {
+    const nextDueAt = lastCompletedAt
+      ? addRoutineIntervalFromCompletion(lastCompletedAt, routine.interval_value, routine.interval_unit).toISOString()
+      : nowIso();
+    db.prepare('UPDATE routines SET last_completed_at=?,next_due_at=?,updated_at=? WHERE id=? AND user_id=?')
+      .run(lastCompletedAt, nextDueAt, nowIso(), routineId, userId);
+  } else {
+    db.prepare('UPDATE routines SET last_completed_at=?,updated_at=? WHERE id=? AND user_id=?')
+      .run(lastCompletedAt, nowIso(), routineId, userId);
+  }
+
+  const refreshed = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=?').get(routineId, userId);
+  if (refreshed?.type === 'frequency' && refreshed.linked_to_routine_id) {
+    const period = getCurrentPeriod(refreshed);
+    const count = db.prepare(`SELECT COUNT(*) AS n FROM completions
+      WHERE routine_id=? AND completed_at>=? AND completed_at<?`)
+      .get(routineId, period.start.toISOString(), period.end.toISOString()).n;
+    if (Number(count) < Number(refreshed.max_count || 1) && refreshed.linked_completed_anchor) {
+      db.prepare('UPDATE routines SET linked_completed_anchor=NULL,updated_at=? WHERE id=? AND user_id=?')
+        .run(nowIso(), routineId, userId);
+    } else if (Number(count) >= Number(refreshed.max_count || 1) && refreshed.next_due_at &&
+               refreshed.linked_completed_anchor !== refreshed.next_due_at) {
+      db.prepare('UPDATE routines SET linked_completed_anchor=next_due_at,updated_at=? WHERE id=? AND user_id=?')
+        .run(nowIso(), routineId, userId);
+    }
+  }
+
+  updateLinkedRoutineSchedules(userId, routineId);
+  queueDriveSync(userId);
+}
+
+function applyRemoteGoogleTaskUpdate(userId, account, localTask, remote, changedRoutines) {
+  if (!localTask || !remote) return;
+  const routine = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=?').get(localTask.routine_id, userId);
+  if (!routine) return;
+
+  const remoteUpdatedAt = toIso(remote.updated, null);
+  const remoteDueDate = remote.due ? isoDateOnly(remote.due) : localTask.due_date;
+  const remoteState = (remote.deleted || remote.status === 'deleted')
+    ? 'deleted'
+    : (remote.status === 'completed' || Boolean(remote.completed) || remote.hidden === true)
+      ? 'completed'
+      : remote.status === 'needsAction' ? 'needsAction' : null;
+  if (!remoteState) return;
+
+  const incomingTime = Date.parse(remoteUpdatedAt || '') || 0;
+  const knownTime = Date.parse(localTask.remote_updated_at || '') || 0;
+  const sameDate = remoteDueDate === localTask.due_date;
+  if (remoteState === localTask.status && sameDate && incomingTime <= knownTime) return;
+
+  if (remoteState === 'deleted') {
+    if (localTask.completion_id) {
+      db.prepare('DELETE FROM completions WHERE id=? AND user_id=?').run(localTask.completion_id, userId);
+      changedRoutines.add(routine.id);
+    }
+    db.prepare("UPDATE google_tasks SET status='deleted',completion_id=NULL,remote_updated_at=COALESCE(?,remote_updated_at),updated_at=? WHERE account_key=? AND task_id=?")
+      .run(remoteUpdatedAt, nowIso(), account.account_key, localTask.task_id);
+    db.prepare('INSERT OR IGNORE INTO routine_task_suppressions(user_id,routine_id,slot_key,created_at) VALUES(?,?,?,?)')
+      .run(userId, routine.id, localTask.slot_key, nowIso());
+    return;
+  }
+
+  if (remoteState === 'completed') {
+    // A completed task with this exact Google ID is authoritative, even when
+    // an older version of Routine Tracker had incorrectly tombstoned its map.
+    if (localTask.status === 'deleted') {
+      db.prepare('DELETE FROM routine_task_suppressions WHERE user_id=? AND routine_id=? AND slot_key=?')
+        .run(userId, routine.id, localTask.slot_key);
+    }
+    const completedAt = toIso(remote.completed, toIso(remote.updated, nowIso()));
+    let completionId = localTask.completion_id;
+    let existingCompletion = completionId
+      ? db.prepare('SELECT id,completed_at FROM completions WHERE id=? AND user_id=?').get(completionId, userId)
+      : null;
+
+    if (!existingCompletion) {
+      const possibleMatch = db.prepare(`SELECT id,completed_at FROM completions
+        WHERE routine_id=? ORDER BY ABS(strftime('%s',completed_at)-strftime('%s',?)) LIMIT 1`)
+        .get(routine.id, completedAt);
+      if (possibleMatch && Math.abs(new Date(possibleMatch.completed_at).getTime() - new Date(completedAt).getTime()) <= 5 * 60 * 1000) {
+        completionId = possibleMatch.id;
+        existingCompletion = possibleMatch;
+      }
+    }
+
+    if (!existingCompletion && !routine.archived) {
+      completionId = makeId('done');
+      db.prepare('INSERT INTO completions(id,routine_id,user_id,completed_at,note) VALUES(?,?,?,?,?)')
+        .run(completionId, routine.id, userId, completedAt, 'Completed in Google Tasks');
+      changedRoutines.add(routine.id);
+    } else if (existingCompletion) {
+      completionId = existingCompletion.id;
+      if (existingCompletion.completed_at !== completedAt) {
+        db.prepare('UPDATE completions SET completed_at=? WHERE id=? AND user_id=?')
+          .run(completedAt, completionId, userId);
+        changedRoutines.add(routine.id);
+      }
+      if (localTask.status !== 'completed') changedRoutines.add(routine.id);
+    } else {
+      completionId = null;
+    }
+
+    db.prepare("UPDATE google_tasks SET status='completed',completion_id=?,due_date=?,remote_updated_at=COALESCE(?,remote_updated_at),updated_at=? WHERE account_key=? AND task_id=?")
+      .run(completionId, remoteDueDate, remoteUpdatedAt, nowIso(), account.account_key, localTask.task_id);
+    return;
+  }
+
+  if (remoteState === 'needsAction') {
+    // Intentional local deletions remain suppressed. A task is only restored
+    // from completion when Google's version is newer than our stored version.
+    if (localTask.status === 'deleted') return;
+    const baseline = localTask.remote_updated_at || (localTask.status === 'completed' ? localTask.updated_at : null);
+    const remoteIsNewer = remoteUpdatedAt && (!baseline || Date.parse(remoteUpdatedAt) > Date.parse(baseline));
+
+    if (localTask.status === 'completed' && remoteIsNewer) {
+      if (localTask.completion_id) {
+        db.prepare('DELETE FROM completions WHERE id=? AND user_id=?').run(localTask.completion_id, userId);
+        changedRoutines.add(routine.id);
+      }
+      db.prepare("UPDATE google_tasks SET status='needsAction',completion_id=NULL,due_date=?,remote_updated_at=?,updated_at=? WHERE account_key=? AND task_id=?")
+        .run(remoteDueDate, remoteUpdatedAt, nowIso(), account.account_key, localTask.task_id);
+    } else if (localTask.status !== 'completed' && (remoteDueDate !== localTask.due_date || incomingTime > knownTime)) {
+      db.prepare("UPDATE google_tasks SET status='needsAction',due_date=?,remote_updated_at=COALESCE(?,remote_updated_at),updated_at=? WHERE account_key=? AND task_id=?")
+        .run(remoteDueDate, remoteUpdatedAt, nowIso(), account.account_key, localTask.task_id);
+    }
+  }
+}
+
+async function syncGoogleTaskChanges(userId, account) {
+  if (!account) return { skipped: true };
+  const tasks = tasksApi(account.account_key);
+  const localRows = db.prepare(`SELECT gt.* FROM google_tasks gt
+    JOIN routines r ON r.id=gt.routine_id
+    WHERE gt.account_key=? AND r.user_id=? AND r.archived=0`)
+    .all(account.account_key, userId);
+  const localByTaskId = new Map(localRows.map((row) => [row.task_id, row]));
+  const changedRoutines = new Set();
+  const lastSyncMs = Date.parse(account.last_task_sync || '') || 0;
+  // Google Tasks supports updatedMin. A small overlap protects against API
+  // indexing delay while avoiding a full list + one GET per local task every run.
+  const updatedMin = lastSyncMs
+    ? new Date(Math.max(0, lastSyncMs - 2 * 60 * 1000)).toISOString()
+    : null;
+  const params = {
+    tasklist: '@default', showCompleted: true, showDeleted: true, showHidden: true,
+    maxResults: 100,
+    fields: 'items(id,status,completed,updated,due,deleted,hidden),nextPageToken'
+  };
+  if (updatedMin) params.updatedMin = updatedMin;
+
+  let pageToken = null;
+  let remoteCount = 0;
+  do {
+    const page = await tasks.tasks.list({ ...params, ...(pageToken ? { pageToken } : {}) });
+    for (const remote of (page.data.items || [])) {
+      if (!remote.id) continue;
+      remoteCount += 1;
+      const localTask = localByTaskId.get(remote.id);
+      if (localTask) applyRemoteGoogleTaskUpdate(userId, account, localTask, remote, changedRoutines);
+    }
+    pageToken = page.data.nextPageToken || null;
+  } while (pageToken);
+
+  // One-time recovery for mappings tombstoned by older releases. This is
+  // intentionally capped and never probes every mapped task on each sync.
+  const legacyTombstones = db.prepare(`SELECT gt.* FROM google_tasks gt
+    JOIN routines r ON r.id=gt.routine_id
+    WHERE gt.account_key=? AND r.user_id=? AND r.archived=0
+      AND gt.status='deleted' AND gt.legacy_probe_done=0
+    ORDER BY gt.updated_at ASC LIMIT 8`).all(account.account_key, userId);
+  for (const localTask of legacyTombstones) {
+    try {
+      const response = await tasks.tasks.get({ tasklist: '@default', task: localTask.task_id });
+      applyRemoteGoogleTaskUpdate(userId, account, localTask, response.data, changedRoutines);
+      db.prepare('UPDATE google_tasks SET legacy_probe_done=1 WHERE account_key=? AND task_id=?')
+        .run(account.account_key, localTask.task_id);
+    } catch (error) {
+      const status = Number(error.code || error.response?.status);
+      if (status === 404) {
+        db.prepare('UPDATE google_tasks SET legacy_probe_done=1,remote_updated_at=COALESCE(remote_updated_at,?) WHERE account_key=? AND task_id=?')
+          .run(nowIso(), account.account_key, localTask.task_id);
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  for (const routineId of changedRoutines) recalculateRoutineAfterGoogleTaskChange(userId, routineId);
+  const syncedAt = nowIso();
+  db.prepare('UPDATE google_accounts SET last_task_sync=?,updated_at=? WHERE account_key=?')
+    .run(syncedAt, syncedAt, account.account_key);
+  return { synced: true, checked: localRows.length, received: remoteCount, changedRoutines: changedRoutines.size };
+}
+async function syncRoutineTasks(userId, routineIds = null, options = {}) {
   if (taskSyncLocks.has(userId)) return { skipped: true, reason: 'sync already running' };
   taskSyncLocks.add(userId);
   try {
   const account = getCurrentGoogleAccount(userId);
   if (!account) return { skipped: true };
+  if (options.pullChanges !== false) await syncGoogleTaskChanges(userId, account);
+  const allRoutines = listRoutines(userId);
+  const selectedIds = Array.isArray(routineIds) ? new Set(routineIds.map((value) => typeof value === 'string' ? value : value?.id).filter(Boolean)) : null;
+  const routines = selectedIds ? allRoutines.filter((routine) => selectedIds.has(routine.id)) : allRoutines;
   const tasks = tasksApi(account.account_key);
-  // Clean up Google Tasks left behind by routines archived before this version.
-  const archivedTasks = db.prepare(`SELECT gt.* FROM google_tasks gt
+  // Full archived-task cleanup is only needed during a full/background sync.
+  const archivedTasks = selectedIds ? [] : db.prepare(`SELECT gt.* FROM google_tasks gt
     JOIN routines r ON r.id=gt.routine_id
     WHERE gt.account_key=? AND r.user_id=? AND r.archived=1 AND gt.status<>'deleted'`)
     .all(account.account_key, userId);
@@ -510,35 +742,85 @@ async function syncRoutineTasks(userId, routines = listRoutines(userId)) {
         .get(account.account_key, routine.id);
     }
     const requestBody = { title: routine.title, notes: routine.notes || 'Routine Tracker checklist item', due: `${dueDate}T00:00:00.000Z` };
-    if (existing && existing.status === 'deleted') continue;
+    if (existing && (existing.status === 'deleted' || existing.status === 'completed')) {
+      // A completed occurrence is terminal. Do not turn it back into a pending
+      // Google Task just because the routine still calculates the same slot.
+      // The next occurrence gets a distinct slot key and its own Task.
+      continue;
+    }
     if (existing) {
-      if (existing.status === 'completed') {
-        await tasks.tasks.patch({ tasklist: '@default', task: existing.task_id, requestBody: { ...requestBody, status: 'needsAction' } });
-        db.prepare("UPDATE google_tasks SET slot_key=?,due_date=?,status='needsAction',updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
-          .run(slotKey, dueDate, nowIso(), account.account_key, routine.id, existing.slot_key);
-      } else if (existing.slot_key !== slotKey || existing.due_date !== dueDate) {
-        await tasks.tasks.patch({ tasklist: '@default', task: existing.task_id, requestBody });
-        db.prepare('UPDATE google_tasks SET slot_key=?,due_date=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
-          .run(slotKey, dueDate, nowIso(), account.account_key, routine.id, existing.slot_key);
+      if (existing.slot_key !== slotKey || existing.due_date !== dueDate) {
+        const patched = await tasks.tasks.patch({ tasklist: '@default', task: existing.task_id, requestBody });
+        db.prepare('UPDATE google_tasks SET slot_key=?,due_date=?,remote_updated_at=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
+          .run(slotKey, dueDate, toIso(patched.data?.updated, null), nowIso(), account.account_key, routine.id, existing.slot_key);
       }
       continue;
     }
     const created = await tasks.tasks.insert({ tasklist: '@default', requestBody });
-    db.prepare('INSERT INTO google_tasks(account_key,routine_id,slot_key,task_id,due_date,status,updated_at) VALUES(?,?,?,?,?,?,?)')
-      .run(account.account_key, routine.id, slotKey, created.data.id, dueDate, 'needsAction', nowIso());
+    db.prepare('INSERT INTO google_tasks(account_key,routine_id,slot_key,task_id,due_date,status,updated_at,remote_updated_at) VALUES(?,?,?,?,?,?,?,?)')
+      .run(account.account_key, routine.id, slotKey, created.data.id, dueDate, 'needsAction', nowIso(), toIso(created.data?.updated, null));
   }
   return { synced: true };
   } finally {
     taskSyncLocks.delete(userId);
   }
 }
+const routineTaskPublishQueues = new Map();
+const taskPullQueues = new Map();
+
+function queueRoutineTaskPublish(userId, routineIds = null) {
+  let queue = routineTaskPublishQueues.get(userId);
+  if (!queue) {
+    queue = { ids: new Set(), all: false, timer: null };
+    routineTaskPublishQueues.set(userId, queue);
+  }
+  if (Array.isArray(routineIds)) {
+    for (const id of routineIds) if (typeof id === 'string') queue.ids.add(id);
+  } else {
+    queue.all = true;
+  }
+  if (queue.timer) clearTimeout(queue.timer);
+  const run = async () => {
+    if (taskSyncLocks.has(userId)) {
+      queue.timer = setTimeout(run, 1500);
+      if (queue.timer.unref) queue.timer.unref();
+      return;
+    }
+    routineTaskPublishQueues.delete(userId);
+    try {
+      await syncRoutineTasks(userId, queue.all ? null : [...queue.ids], { pullChanges: false });
+    } catch (error) {
+      console.warn(`Google Task publish failed for ${userId}:`, error.message);
+    }
+  };
+  queue.timer = setTimeout(run, 900);
+  if (queue.timer.unref) queue.timer.unref();
+}
+
+function queueTaskPullSync(userId) {
+  if (taskPullQueues.has(userId) || taskSyncLocks.has(userId)) return;
+  const account = getCurrentGoogleAccount(userId);
+  if (!account) return;
+  const last = Date.parse(account.last_task_sync || '') || 0;
+  if (Date.now() - last < TASK_SYNC_BOOTSTRAP_COOLDOWN_MS) return;
+  const timer = setTimeout(async () => {
+    taskPullQueues.delete(userId);
+    if (taskSyncLocks.has(userId)) return;
+    try { await syncRoutineTasks(userId, null, { pullChanges: true }); }
+    catch (error) { console.warn(`Google Task refresh failed for ${userId}:`, error.message); }
+  }, 250);
+  if (timer.unref) timer.unref();
+  taskPullQueues.set(userId, timer);
+}
+
 async function completeCurrentGoogleTask(userId, routine) {
   const account = getCurrentGoogleAccount(userId);
   if (!account) return;
   const row = db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='needsAction' ORDER BY updated_at DESC LIMIT 1").get(account.account_key, routine.id);
   if (!row) return;
-  await tasksApi(account.account_key).tasks.patch({ tasklist: '@default', task: row.task_id, requestBody: { status: 'completed', completed: nowIso() } });
-  db.prepare('UPDATE google_tasks SET status=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?').run('completed', nowIso(), account.account_key, routine.id, row.slot_key);
+  const patched = await tasksApi(account.account_key).tasks.patch({ tasklist: '@default', task: row.task_id, requestBody: { status: 'completed', completed: nowIso() } });
+  db.prepare('UPDATE google_tasks SET status=?,remote_updated_at=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
+    .run('completed', toIso(patched.data?.updated, null), nowIso(), account.account_key, routine.id, row.slot_key);
   return { ...row, account_key: account.account_key };
 }
 
@@ -947,7 +1229,7 @@ function parseRoutineBody(body, existing = null) {
   const lastRaw = suppliedLast ? body.lastCompletedAt : existing?.last_completed_at;
   const lastCompletedAt = lastRaw ? toIso(lastRaw, null) : null;
   const nextDueAt = linkedId ? linkedNextDueAt : lastCompletedAt
-    ? addInterval(lastCompletedAt, intervalValue, intervalUnit).toISOString()
+    ? addRoutineIntervalFromCompletion(lastCompletedAt, intervalValue, intervalUnit).toISOString()
     : toIso(body.nextDueAt ?? existing?.next_due_at, nowIso());
   return { ...common, min_count: null, max_count: null, period_value: null, period_unit: null,
     interval_value: intervalValue, interval_unit: intervalUnit, start_at: null, progressive: 1,
@@ -1037,9 +1319,11 @@ app.get('/auth/google/callback', async (req, res, next) => {
   }
 });
 
-app.get('/api/bootstrap', async (req, res) => {
+app.get('/api/bootstrap', (req, res) => {
+  // Never make the dashboard wait on Google. Pull changes in the background;
+  // the next lightweight bootstrap poll paints the reconciled local state.
+  queueTaskPullSync(req.userId);
   const routines = listRoutines(req.userId);
-  try { await syncRoutineTasks(req.userId, routines); } catch (error) { console.warn('Google Tasks sync failed:', error.message); }
   res.json({
     appVersion: APP_VERSION,
     csrfToken: req.session.csrfToken,
@@ -1065,6 +1349,7 @@ app.post('/api/routines', (req, res) => {
     )`).run({ id, user_id: req.userId, ...data, created_at: stamp, updated_at: stamp });
     if (!data.linked_to_routine_id) updateLinkedRoutineSchedules(req.userId, id);
     queueDriveSync(req.userId);
+    queueRoutineTaskPublish(req.userId, [id]);
     res.status(201).json({ routine: publicRoutine(db.prepare('SELECT * FROM routines WHERE id = ?').get(id)) });
   } catch (error) { res.status(400).json({ error: error.message }); }
 });
@@ -1079,6 +1364,7 @@ app.patch('/api/routines/:id', (req, res) => {
       WHERE id=@id AND user_id=@user_id`).run({ ...data, updated_at: nowIso(), id: existing.id, user_id: req.userId });
     if (!data.linked_to_routine_id) updateLinkedRoutineSchedules(req.userId, existing.id);
     queueDriveSync(req.userId);
+    queueRoutineTaskPublish(req.userId, [existing.id]);
     res.json({ routine: publicRoutine(db.prepare('SELECT * FROM routines WHERE id = ?').get(existing.id)) });
   } catch (error) { res.status(400).json({ error: error.message }); }
 });
@@ -1159,7 +1445,7 @@ app.post('/api/routines/:id/complete', async (req, res) => {
     if (completedGoogleTask) db.prepare('UPDATE google_tasks SET completion_id=? WHERE account_key=? AND routine_id=? AND slot_key=?')
       .run(completionId, completedGoogleTask.account_key, routine.id, completedGoogleTask.slot_key);
     if (routine.type === 'interval' && !routine.linked_to_routine_id) {
-      const nextDueAt = addInterval(completedAt, routine.interval_value, routine.interval_unit).toISOString();
+      const nextDueAt = addRoutineIntervalFromCompletion(completedAt, routine.interval_value, routine.interval_unit).toISOString();
       db.prepare('UPDATE routines SET last_completed_at=?,next_due_at=?,updated_at=? WHERE id=?')
         .run(completedAt, nextDueAt, nowIso(), routine.id);
       updateLinkedRoutineSchedules(req.userId, routine.id);
@@ -1177,7 +1463,7 @@ app.post('/api/routines/:id/complete', async (req, res) => {
     }
     queueDriveSync(req.userId);
     const updated = db.prepare('SELECT * FROM routines WHERE id = ?').get(routine.id);
-    try { await syncRoutineTasks(req.userId, [publicRoutine(updated)]); } catch (error) { console.warn('Could not create next Google Task:', error.message); }
+    queueRoutineTaskPublish(req.userId, [routine.id]);
     res.json({ routine: publicRoutine(updated), completion: { id: completionId, completedAt } });
   } catch (error) { res.status(400).json({ error: error.message }); }
 });
@@ -1217,7 +1503,7 @@ app.delete('/api/history/:id', async (req, res) => {
   const routine = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=?').get(row.routine_id, req.userId);
   if (routine && routine.type === 'interval' && !routine.linked_to_routine_id) {
     const latest = db.prepare('SELECT completed_at FROM completions WHERE routine_id=? ORDER BY completed_at DESC LIMIT 1').get(routine.id);
-    const nextDue = latest ? addInterval(latest.completed_at, routine.interval_value, routine.interval_unit).toISOString() : nowIso();
+    const nextDue = latest ? addRoutineIntervalFromCompletion(latest.completed_at, routine.interval_value, routine.interval_unit).toISOString() : nowIso();
     db.prepare('UPDATE routines SET last_completed_at=?,next_due_at=?,updated_at=? WHERE id=?').run(latest?.completed_at || null, nextDue, nowIso(), routine.id);
     updateLinkedRoutineSchedules(req.userId, routine.id);
   } else if (routine && routine.type === 'interval' && routine.linked_to_routine_id) {
@@ -1233,7 +1519,7 @@ app.delete('/api/history/:id', async (req, res) => {
   }
   updateLinkedRoutineSchedules(req.userId, row.routine_id);
   queueDriveSync(req.userId);
-  try { await syncRoutineTasks(req.userId); } catch (error) { console.warn('Google Task history-delete sync failed:', error.message); }
+  queueRoutineTaskPublish(req.userId, [row.routine_id]);
   res.json({ ok: true });
 });
 
@@ -1247,7 +1533,7 @@ app.patch('/api/routines/:id/reschedule', async (req, res) => {
     db.prepare('UPDATE routines SET next_due_at=?,updated_at=? WHERE id=? AND user_id=?').run(nextDueAt, nowIso(), routine.id, req.userId);
     updateLinkedRoutineSchedules(req.userId, routine.id);
     queueDriveSync(req.userId);
-    try { await syncRoutineTasks(req.userId); } catch (error) { console.warn('Google Task reschedule sync failed:', error.message); }
+    queueRoutineTaskPublish(req.userId, [routine.id]);
     res.json({ ok: true, routine: publicRoutine(db.prepare('SELECT * FROM routines WHERE id=?').get(routine.id)) });
   } catch (error) { res.status(400).json({ error: error.message }); }
 });
@@ -1270,9 +1556,9 @@ app.patch('/api/completions/:id', async (req, res) => {
       : null;
     let googleTaskUpdated = false;
     if (linkedTask) {
-      const dateOnly = isoDateOnly(completedAt);
+      const dateOnly = routineDateOnly(completedAt);
       try {
-        await tasksApi(account.account_key).tasks.patch({
+        const patched = await tasksApi(account.account_key).tasks.patch({
           tasklist: '@default',
           task: linkedTask.task_id,
           requestBody: {
@@ -1280,8 +1566,8 @@ app.patch('/api/completions/:id', async (req, res) => {
             completed: completedAt
           }
         });
-        db.prepare('UPDATE google_tasks SET due_date=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
-          .run(dateOnly, nowIso(), account.account_key, linkedTask.routine_id, linkedTask.slot_key);
+        db.prepare('UPDATE google_tasks SET due_date=?,remote_updated_at=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
+          .run(dateOnly, toIso(patched.data?.updated, null), nowIso(), account.account_key, linkedTask.routine_id, linkedTask.slot_key);
         googleTaskUpdated = true;
       } catch (error) {
         if (Number(error.code || error.response?.status) === 404) {
@@ -1300,7 +1586,7 @@ app.patch('/api/completions/:id', async (req, res) => {
     const routine = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=?').get(completion.routine_id, req.userId);
     if (routine && routine.type === 'interval' && !routine.linked_to_routine_id) {
       const latest = db.prepare('SELECT completed_at FROM completions WHERE routine_id=? ORDER BY completed_at DESC LIMIT 1').get(routine.id);
-      const nextDue = latest ? addInterval(latest.completed_at, routine.interval_value, routine.interval_unit).toISOString() : nowIso();
+      const nextDue = latest ? addRoutineIntervalFromCompletion(latest.completed_at, routine.interval_value, routine.interval_unit).toISOString() : nowIso();
       db.prepare('UPDATE routines SET last_completed_at=?,next_due_at=?,updated_at=? WHERE id=?').run(latest?.completed_at || null, nextDue, nowIso(), routine.id);
       updateLinkedRoutineSchedules(req.userId, routine.id);
     } else if (routine && routine.type === 'interval' && routine.linked_to_routine_id) {
@@ -1313,7 +1599,7 @@ app.patch('/api/completions/:id', async (req, res) => {
     }
     if (routine) updateLinkedRoutineSchedules(req.userId, routine.id);
     queueDriveSync(req.userId);
-    try { await syncRoutineTasks(req.userId); } catch (error) { console.warn('Google Task completion-date follow-up sync failed:', error.message); }
+    queueRoutineTaskPublish(req.userId, [completion.routine_id]);
     res.json({ ok: true, googleTaskUpdated });
   } catch (error) { res.status(400).json({ error: error.message }); }
 });
@@ -1328,9 +1614,10 @@ app.get('/api/calendar', async (req, res) => {
     let syncWarning = null;
     if (account) {
       const last = account.last_calendar_sync ? new Date(account.last_calendar_sync).getTime() : 0;
-      if (Date.now() - last > CALENDAR_SYNC_INTERVAL_MS) {
-        try { await syncCalendarForAccount(account.account_key); }
-        catch (error) { syncWarning = error.message; }
+      if (Date.now() - last > CALENDAR_SYNC_INTERVAL_MS && !calendarSyncLocks.has(account.account_key)) {
+        setImmediate(() => syncCalendarForAccount(account.account_key).catch((error) => {
+          console.warn(`Calendar refresh failed for ${account.account_key}:`, error.message);
+        }));
       }
     }
     const events = [];

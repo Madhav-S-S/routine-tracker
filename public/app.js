@@ -21,6 +21,14 @@ const state = {
   selectedCalendarEvent: null
 };
 
+// Coalesce redundant refreshes so a page switch, a save and a visibility event
+// cannot launch overlapping copies of the same GET requests.
+let bootstrapLoadPromise = null;
+let historyLoadPromise = null;
+const calendarLoadPromises = new Map();
+let foregroundRefreshRunning = false;
+let lastForegroundRefreshAt = 0;
+
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const COLOR_HEX = { lavender: '#a895f0', mint: '#72c6a0', peach: '#e9a77f', blue: '#84a8df', rose: '#d98eaa', gold: '#d8b85d' };
@@ -346,23 +354,30 @@ async function api(path, options = {}) {
   return data;
 }
 
-async function loadBootstrap(showError = true) {
-  try {
-    const data = await api('/api/bootstrap');
-    state.csrfToken = data.csrfToken;
-    state.user = data.user;
-    state.routines = data.routines || [];
-    state.stats = data.stats || {};
-    state.google = data.google || { connected: false };
-    renderAll();
-    if (state.activePage === 'calendar') loadCalendar();
-    setSyncState('saved', state.google.connected ? 'Saved · Google connected' : 'Saved on this server');
-  } catch (error) {
-    if (showError) toast(error.message, 'error');
-    setSyncState('error', 'Could not load data');
-  }
+function loadBootstrap(showError = true) {
+  if (bootstrapLoadPromise) return bootstrapLoadPromise;
+  const request = (async () => {
+    try {
+      const data = await api('/api/bootstrap');
+      state.csrfToken = data.csrfToken;
+      state.user = data.user;
+      state.routines = data.routines || [];
+      state.stats = data.stats || {};
+      state.google = data.google || { connected: false };
+      renderAll();
+      setSyncState('saved', state.google.connected ? 'Saved · Google connected' : 'Saved on this server');
+      return data;
+    } catch (error) {
+      if (showError) toast(error.message, 'error');
+      setSyncState('error', 'Could not load data');
+      return null;
+    }
+  })();
+  bootstrapLoadPromise = request;
+  return request.finally(() => {
+    if (bootstrapLoadPromise === request) bootstrapLoadPromise = null;
+  });
 }
-
 function renderProfile() {
   const user = state.user || {};
   const name = user.display_name || 'Your space';
@@ -503,24 +518,37 @@ function setPage(page) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-async function loadCalendar() {
+function loadCalendar() {
   const month = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
+  if (calendarLoadPromises.has(month)) return calendarLoadPromises.get(month);
   $('#calendarMonthTitle').textContent = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' }).format(state.calendarMonth);
-  $('#calendarGrid').innerHTML = '<div class="calendar-empty">Loading your month…</div>';
-  try {
-    const data = await api(`/api/calendar?month=${encodeURIComponent(month)}`);
-    state.calendarEvents = data.events || [];
-    state.calendarWarning = data.syncWarning;
-    if (state.selectedCalendarDate && !state.selectedCalendarDate.startsWith(month)) state.selectedCalendarDate = null;
-    renderCalendarGrid();
-    $('#calendarFootnote').textContent = data.syncWarning
-      ? `Calendar sync needs attention: ${data.syncWarning}`
-      : state.google.connected
-        ? `Google Calendar refreshed ${timeAgo(data.googleLastSync)}. Your routine dates are shown here, too.`
-        : 'Connect Google in Settings to display your primary Google Calendar events here.';
-  } catch (error) {
-    $('#calendarGrid').innerHTML = `<div class="calendar-empty">${escapeHtml(error.message)}</div>`;
-  }
+  if (!state.calendarEvents.length) $('#calendarGrid').innerHTML = '<div class="calendar-empty">Loading your month…</div>';
+  const request = (async () => {
+    try {
+      const data = await api(`/api/calendar?month=${encodeURIComponent(month)}`);
+      // Ignore a late response if the user has already navigated to another month.
+      const currentMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
+      if (currentMonth !== month) return data;
+      state.calendarEvents = data.events || [];
+      state.calendarWarning = data.syncWarning;
+      if (state.selectedCalendarDate && !state.selectedCalendarDate.startsWith(month)) state.selectedCalendarDate = null;
+      renderCalendarGrid();
+      $('#calendarFootnote').textContent = data.syncWarning
+        ? `Calendar sync needs attention: ${data.syncWarning}`
+        : state.google.connected
+          ? `Google Calendar refreshed ${timeAgo(data.googleLastSync)}. Your routine dates are shown here, too.`
+          : 'Connect Google in Settings to display your primary Google Calendar events here.';
+      return data;
+    } catch (error) {
+      const currentMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
+      if (currentMonth === month) $('#calendarGrid').innerHTML = `<div class="calendar-empty">${escapeHtml(error.message)}</div>`;
+      return null;
+    }
+  })();
+  calendarLoadPromises.set(month, request);
+  return request.finally(() => {
+    if (calendarLoadPromises.get(month) === request) calendarLoadPromises.delete(month);
+  });
 }
 function calendarEventsForDate(key) {
   return state.calendarEvents
@@ -687,21 +715,29 @@ function renderCalendarGrid() {
   renderCalendarDayDetails();
 }
 
-async function loadHistory() {
-  $('#historyList').innerHTML = '<div class="history-empty">Loading activity…</div>';
-  try {
-    const data = await api('/api/history?limit=100');
-    const rows = data.history || [];
-    if (!rows.length) {
-      $('#historyList').innerHTML = '<div class="history-empty">Your completed routines will appear here. Complete a routine to get started.</div>';
-      return;
+function loadHistory() {
+  if (historyLoadPromise) return historyLoadPromise;
+  if (!$('#historyList').children.length) $('#historyList').innerHTML = '<div class="history-empty">Loading activity…</div>';
+  const request = (async () => {
+    try {
+      const data = await api('/api/history?limit=100');
+      const rows = data.history || [];
+      if (!rows.length) {
+        $('#historyList').innerHTML = '<div class="history-empty">Your completed routines will appear here. Complete a routine to get started.</div>';
+        return data;
+      }
+      $('#historyList').innerHTML = rows.map((row) => `<div class="history-entry"><div class="history-mark">✓</div><div class="history-entry-copy"><strong>${escapeHtml(row.title)}</strong><small>${escapeHtml(row.note || 'Routine completed')}</small></div><div class="history-date">${formatDate(row.completed_at, { day: 'numeric', month: 'short' })} · ${formatDate(row.completed_at, { hour: 'numeric', minute: '2-digit' })}</div><button class="history-delete" type="button" data-action="delete-activity" data-id="${escapeHtml(row.id)}" aria-label="Delete activity" title="Delete activity">×</button></div>`).join('');
+      return data;
+    } catch (error) {
+      $('#historyList').innerHTML = `<div class="history-empty">${escapeHtml(error.message)}</div>`;
+      return null;
     }
-    $('#historyList').innerHTML = rows.map((row) => `<div class="history-entry"><div class="history-mark">✓</div><div class="history-entry-copy"><strong>${escapeHtml(row.title)}</strong><small>${escapeHtml(row.note || 'Routine completed')}</small></div><div class="history-date">${formatDate(row.completed_at, { day: 'numeric', month: 'short' })} · ${formatDate(row.completed_at, { hour: 'numeric', minute: '2-digit' })}</div><button class="history-delete" type="button" data-action="delete-activity" data-id="${escapeHtml(row.id)}" aria-label="Delete activity" title="Delete activity">×</button></div>`).join('');
-  } catch (error) {
-    $('#historyList').innerHTML = `<div class="history-empty">${escapeHtml(error.message)}</div>`;
-  }
+  })();
+  historyLoadPromise = request;
+  return request.finally(() => {
+    if (historyLoadPromise === request) historyLoadPromise = null;
+  });
 }
-
 async function deleteActivity(id) {
   if (!confirm('Delete this activity? This will remove it from your history, update routine progress, and delete its matching Google Task if one was synced.')) return;
   try { await api(`/api/history/${encodeURIComponent(id)}`, { method: 'DELETE' }); await loadBootstrap(); await loadHistory(); if (state.activePage === 'calendar') await loadCalendar(); toast('Activity deleted.'); }
@@ -1009,6 +1045,22 @@ function setupDateInputs() {
       popover.dataset.month = key.slice(0, 7);
       renderDatePopover(input, popover);
       popover.hidden = false;
+      // Keep the year dropdown and its arrow inside the visible area. Pickers
+      // near the right edge of a modal/page are shifted left instead of clipped.
+      requestAnimationFrame(() => {
+        const wrapRect = wrap.getBoundingClientRect();
+        const modal = wrap.closest('.routine-modal');
+        const modalRect = modal ? modal.getBoundingClientRect() : null;
+        const popupWidth = popover.getBoundingClientRect().width || Math.min(320, window.innerWidth - 24);
+        const viewportRight = window.innerWidth - 12;
+        const allowedRight = modalRect ? Math.min(viewportRight, modalRect.right - 12) : viewportRight;
+        const allowedLeft = modalRect ? Math.max(12, modalRect.left + 12) : 12;
+        let left = 0;
+        const rightIfDefault = wrapRect.left + popupWidth;
+        if (rightIfDefault > allowedRight) left = allowedRight - rightIfDefault;
+        if (wrapRect.left + left < allowedLeft) left = allowedLeft - wrapRect.left;
+        popover.style.left = `${Math.round(left)}px`;
+      });
     };
     input.addEventListener('click', open);
     input.addEventListener('focus', open);
@@ -1186,8 +1238,21 @@ async function init() {
   $('#lastCompletedAt').value = todayText;
   $('#firstDueAt').value = todayText;
   await loadBootstrap();
-  window.setInterval(() => { if (!document.hidden) loadBootstrap(false); }, 60000);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) loadBootstrap(false); });
+  lastForegroundRefreshAt = Date.now();
+  const refreshForegroundData = async () => {
+    if (document.hidden || foregroundRefreshRunning || Date.now() - lastForegroundRefreshAt < 15000) return;
+    foregroundRefreshRunning = true;
+    lastForegroundRefreshAt = Date.now();
+    try {
+      await loadBootstrap(false);
+      if (state.activePage === 'calendar') await loadCalendar();
+      else if (state.activePage === 'history') await loadHistory();
+    } finally {
+      foregroundRefreshRunning = false;
+    }
+  };
+  window.setInterval(refreshForegroundData, 60000);
+  document.addEventListener('visibilitychange', refreshForegroundData);
   const params = new URLSearchParams(window.location.search);
   if (params.has('connected')) toast('Google account connected. Calendar sync has started.');
   if (params.has('google_error')) toast(`Google connection: ${params.get('google_error')}`, 'error');

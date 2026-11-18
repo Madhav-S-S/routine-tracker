@@ -1460,3 +1460,54 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .mini-bg-picker { min-height: 23px; padding-inline: 5px; }
   .icon-bg-auto { min-height: 23px; padding-inline: 6px; }
 }
+
+
+/* Date picker header: reserve room for the entire year selector and native value. */
+.date-picker-popover {
+  width: min(320px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  overflow: visible;
+}
+.date-picker-head {
+  grid-template-columns: 28px minmax(0, 1fr) 28px;
+  gap: 6px;
+}
+.date-picker-head-selects {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  gap: 5px;
+  overflow: visible;
+}
+.date-picker-head select {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+  height: 32px;
+  padding: 0 24px 0 8px;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='m1 1 4 4 4-4' fill='none' stroke='%23aaa5bd' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 10px 6px;
+  white-space: nowrap;
+  text-overflow: clip;
+}
+.date-picker-head .date-picker-month-select {
+  width: auto;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.date-picker-head .date-picker-year-select {
+  width: 88px;
+  min-width: 88px;
+  flex: 0 0 88px;
+  padding-left: 8px;
+  padding-right: 25px;
+  text-align: left;
+}
+.date-picker-head select:focus-visible {
+  outline-offset: 1px;
+}
+.date-entry-wrap { overflow: visible; }
