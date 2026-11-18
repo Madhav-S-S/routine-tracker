@@ -10,6 +10,8 @@ const state = {
   routineFilter: 'all',
   selectedType: 'frequency',
   selectedColor: 'lavender',
+  createRequestId: null,
+  savingRoutine: false,
   calendarMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
   calendarEvents: [],
   calendarWarning: null
@@ -128,16 +130,8 @@ function renderProfile() {
   $('#sidebarEmail').textContent = email;
   const initial = (name.trim()[0] || 'Y').toUpperCase();
   $('#sidebarAvatar').textContent = initial;
-  $('#topAvatar').textContent = initial;
-  if (user.picture) {
-    $('#sidebarAvatar').innerHTML = `<img src="${escapeHtml(user.picture)}" alt="">`;
-    $('#topAvatar').innerHTML = `<img src="${escapeHtml(user.picture)}" alt="">`;
-  }
+  if (user.picture) $('#sidebarAvatar').innerHTML = `<img src="${escapeHtml(user.picture)}" alt="">`;
   $('#navRoutineCount').textContent = String(state.routines.length);
-  $('#todayLabel').textContent = formatLongDate().toUpperCase();
-  const hour = new Date().getHours();
-  const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
-  $('#welcomeTitle').innerHTML = `${greeting}, make room for <em>what matters.</em>`;
 }
 
 function renderStats() {
@@ -150,6 +144,7 @@ function renderStats() {
 function routineStatusText(routine) {
   if (routine.type === 'frequency') {
     if (routine.maximumReached) return 'Target complete';
+    if (routine.progressive && !routine.checklistAvailable) return `Next check-in unlocks ${formatDate(routine.nextOpportunityAt)}`;
     if (routine.minimumReached) return 'Minimum reached';
     return `${routine.remainingMinimum} more to reach minimum`;
   }
@@ -167,7 +162,8 @@ function routineCard(routine) {
   const completed = isFrequency && routine.maximumReached;
   const statusGood = isFrequency ? routine.minimumReached : !routine.isDue;
   const status = routineStatusText(routine);
-  const actionLabel = completed ? 'All done' : isFrequency ? 'Log a check-in' : 'Mark complete';
+  const canCheckFrequency = !isFrequency || routine.checklistAvailable;
+  const actionLabel = completed ? 'All done' : (isFrequency && !canCheckFrequency) ? `Unlocks ${formatDate(routine.nextOpportunityAt, { day: 'numeric', month: 'short' })}` : isFrequency ? 'Log a check-in' : 'Mark complete';
   return `
     <article class="routine-card ${color}" data-routine-card="${escapeHtml(routine.id)}">
       <div class="routine-top">
@@ -176,15 +172,15 @@ function routineCard(routine) {
         <button class="routine-menu" type="button" data-action="edit" data-id="${escapeHtml(routine.id)}" aria-label="Edit ${escapeHtml(routine.title)}" title="Edit">✎</button>
         <button class="routine-menu" type="button" data-action="archive" data-id="${escapeHtml(routine.id)}" aria-label="Archive ${escapeHtml(routine.title)}" title="Archive">×</button>
       </div>
-      <div class="routine-meta"><span>${escapeHtml(isFrequency ? periodLabel(routine) : routine.cadenceLabel)}</span><strong>${escapeHtml(isFrequency ? `${routine.completedCount}/${routine.max_count}` : routine.daysUntilDue < 0 ? `${Math.abs(routine.daysUntilDue)}d late` : routine.daysUntilDue === 0 ? 'Today' : `${routine.daysUntilDue}d`)}</strong></div>
+      <div class="routine-meta"><span>${escapeHtml(isFrequency ? `${periodLabel(routine)}${routine.progressive ? ' · Progressive' : ''}` : routine.cadenceLabel)}</span><strong>${escapeHtml(isFrequency ? `${routine.completedCount}/${routine.max_count}` : routine.daysUntilDue < 0 ? `${Math.abs(routine.daysUntilDue)}d late` : routine.daysUntilDue === 0 ? 'Today' : `${routine.daysUntilDue}d`)}</strong></div>
       <div class="progress-track"><div class="progress-fill" style="width:${isFrequency ? progress : (routine.isDue ? 100 : Math.max(8, Math.min(100, 100 - routine.daysUntilDue * 5)))}%"></div></div>
-      <div class="routine-card-footer"><span class="routine-status"><i class="status-dot ${statusGood ? 'good' : ''}"></i>${escapeHtml(status)}</span><button class="routine-action" type="button" data-action="complete" data-id="${escapeHtml(routine.id)}" ${completed ? 'disabled' : ''}>${actionLabel} ${completed ? '✓' : '→'}</button></div>
+      <div class="routine-card-footer"><span class="routine-status"><i class="status-dot ${statusGood ? 'good' : ''}"></i>${escapeHtml(status)}</span><button class="routine-action" type="button" data-action="complete" data-id="${escapeHtml(routine.id)}" ${(completed || !canCheckFrequency) ? 'disabled' : ''}>${actionLabel} ${completed ? '✓' : '→'}</button></div>
     </article>`;
 }
 
 function renderChecklist() {
   const items = state.routines.filter((r) => {
-    if (r.type === 'frequency') return !r.maximumReached;
+    if (r.type === 'frequency') return Boolean(r.checklistAvailable);
     return r.isDue;
   }).sort((a, b) => {
     const aDue = a.type === 'interval' ? 0 : 1;
@@ -199,7 +195,7 @@ function renderChecklist() {
   $('#checklistList').innerHTML = items.map((r) => {
     const isFrequency = r.type === 'frequency';
     const info = isFrequency
-      ? (r.minimumReached ? `Minimum reached · ${r.completedCount}/${r.max_count} this period` : `${r.remainingMinimum} more needed · ${r.completedCount}/${r.max_count} this period`)
+      ? `${r.progressive ? `Progressive · check-in ${r.nextOccurrenceNumber} of ${r.max_count}` : (r.minimumReached ? 'Minimum reached' : `${r.remainingMinimum} more needed`)} · ${r.completedCount}/${r.max_count} this period`
       : `${dueDescription(r)} · ${r.cadenceLabel}`;
     const label = isFrequency ? (r.minimumReached ? 'Log extra' : 'Check in') : 'Mark done';
     return `<article class="checklist-card"><div class="check-spot ${escapeHtml(r.color)}">${colorSymbols[r.color] || '✧'}</div><div class="check-info"><strong>${escapeHtml(r.title)}</strong><small>${escapeHtml(info)}</small></div><button class="check-action" data-action="complete" data-id="${escapeHtml(r.id)}">${label} <span>→</span></button></article>`;
@@ -223,7 +219,7 @@ function renderGoogleSettings() {
   $('#googleConnectButton').textContent = 'Connect Google ↗';
   $('#googleConnectButton').href = '/auth/google';
   $('#googleSwitchButton').hidden = !connected;
-  $('#googleSwitchButton').textContent = 'Switch account';
+  $('#googleSwitchButton').textContent = 'Reconnect / switch account';
   $('#googleUnlinkButton').hidden = !connected;
   $('#connectedAccount').hidden = !connected;
   if (connected) {
@@ -238,8 +234,8 @@ function renderGoogleSettings() {
   $('#calendarStatus').textContent = connected ? (google.lastCalendarSync ? 'Syncing automatically' : 'Connected · first sync') : 'Not connected';
   $('#calendarStatus').classList.toggle('ready', connected);
   $('#calendarSyncText').textContent = connected
-    ? `Primary calendar refreshed ${timeAgo(google.lastCalendarSync)}. Automatic refresh runs every few minutes.`
-    : 'Connect Google to start syncing your primary calendar.';
+    ? (google.error ? `Google sync needs attention: ${google.error}` : `Primary calendar refreshed ${timeAgo(google.lastCalendarSync)}. Routine checklist tasks and repeat dates are also added automatically.`)
+    : 'Connect Google to show events and add routine tasks to your primary calendar.';
 }
 
 function renderAll() {
@@ -258,6 +254,7 @@ function setPage(page) {
   const label = ({ dashboard: 'Overview', calendar: 'Calendar', routines: 'All routines', history: 'Activity', settings: 'Settings & sync' })[page];
   $('#breadcrumbCurrent').textContent = label;
   $('#sidebar').classList.remove('open');
+  $('#mobileMenuButton').setAttribute('aria-expanded', 'false');
   if (page === 'calendar') loadCalendar();
   if (page === 'history') loadHistory();
   if (page === 'settings') renderGoogleSettings();
@@ -339,6 +336,7 @@ function toggleLastDoneFields() {
 }
 function openRoutineModal(routine = null) {
   $('#routineForm').reset();
+  state.createRequestId = routine ? null : (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`);
   $('#routineId').value = routine?.id || '';
   $('#modalTitle').textContent = routine ? 'Edit routine' : 'Create a routine';
   $('#routineTitle').value = routine?.title || '';
@@ -352,6 +350,7 @@ function openRoutineModal(routine = null) {
   $('#periodValue').value = routine?.period_value ?? 1;
   $('#periodUnit').value = routine?.period_unit || 'weeks';
   $('#startAt').value = routine?.start_at ? dateKey(routine.start_at) : today;
+  $('#progressive').checked = routine ? Boolean(routine.progressive) : true;
   $('#intervalValue').value = routine?.interval_value ?? 2;
   $('#intervalUnit').value = routine?.interval_unit || 'weeks';
   const hasLast = routine ? Boolean(routine.last_completed_at) : true;
@@ -373,13 +372,17 @@ function closeRoutineModal() {
 
 async function saveRoutine(event) {
   event.preventDefault();
+  if (state.savingRoutine) return;
   const id = $('#routineId').value;
   const title = $('#routineTitle').value.trim();
   if (!title) return toast('Give your routine a name first.', 'error');
+  state.savingRoutine = true;
   let body = { title, notes: $('#routineNotes').value, color: state.selectedColor, type: state.selectedType };
+  if (!id) body.requestId = state.createRequestId;
   if (state.selectedType === 'frequency') {
     body = { ...body, minCount: Number($('#minCount').value), maxCount: Number($('#maxCount').value),
-      periodValue: Number($('#periodValue').value), periodUnit: $('#periodUnit').value, startAt: dateInputToIso($('#startAt').value) };
+      periodValue: Number($('#periodValue').value), periodUnit: $('#periodUnit').value, startAt: dateInputToIso($('#startAt').value),
+      progressive: $('#progressive').checked };
   } else {
     body = { ...body, intervalValue: Number($('#intervalValue').value), intervalUnit: $('#intervalUnit').value };
     if ($('#hasLastDone').checked) body.lastCompletedAt = dateInputToIso($('#lastCompletedAt').value);
@@ -390,16 +393,18 @@ async function saveRoutine(event) {
   button.textContent = 'Saving…';
   setSyncState('syncing', 'Saving your routine');
   try {
-    await api(id ? `/api/routines/${encodeURIComponent(id)}` : '/api/routines', {
+    const result = await api(id ? `/api/routines/${encodeURIComponent(id)}` : '/api/routines', {
       method: id ? 'PATCH' : 'POST', body: JSON.stringify(body)
     });
     closeRoutineModal();
     await loadBootstrap();
     if (state.activePage === 'calendar') await loadCalendar();
-    toast(id ? 'Routine updated.' : 'A new routine is in your space.');
+    state.createRequestId = null;
+    toast(id ? 'Routine updated.' : (result.duplicateRequest ? 'This routine was already saved.' : 'One routine saved.'));
   } catch (error) {
     toast(error.message, 'error');
   } finally {
+    state.savingRoutine = false;
     button.disabled = false;
     button.innerHTML = 'Save routine <span>→</span>';
   }
@@ -510,7 +515,10 @@ function installHandlers() {
   $('#calendarSyncButton').addEventListener('click', calendarSync);
   $('#googleUnlinkButton').addEventListener('click', unlinkGoogle);
   $('#googleSwitchButton').addEventListener('click', () => { window.location.href = '/auth/google?switch=1'; });
-  $('#mobileMenuButton').addEventListener('click', () => $('#sidebar').classList.toggle('open'));
+  $('#mobileMenuButton').addEventListener('click', () => {
+    const open = $('#sidebar').classList.toggle('open');
+    $('#mobileMenuButton').setAttribute('aria-expanded', String(open));
+  });
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !$('#routineModal').hidden) closeRoutineModal(); });
 }
 

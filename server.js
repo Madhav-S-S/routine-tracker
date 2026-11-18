@@ -22,7 +22,7 @@ const DRIVE_AUTO_SYNC = String(process.env.DRIVE_AUTO_SYNC || 'true').toLowerCas
 const DRIVE_AUTO_SYNC_DELAY_MS = Number(process.env.DRIVE_AUTO_SYNC_DELAY_MS || 6000);
 const CALENDAR_SYNC_INTERVAL_MS = Number(process.env.CALENDAR_SYNC_INTERVAL_MS || 300000);
 const SESSION_MAX_AGE = 1000 * 60 * 60 * 24 * 365;
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 
 if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.includes('replace-with')) {
   throw new Error('Set SESSION_SECRET in your .env file before starting the app.');
@@ -76,6 +76,7 @@ db.exec(`
     max_count INTEGER,
     period_value INTEGER,
     period_unit TEXT,
+    progressive INTEGER NOT NULL DEFAULT 0,
     interval_value INTEGER,
     interval_unit TEXT,
     start_at TEXT,
@@ -119,6 +120,32 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_completions_routine_date ON completions(routine_id, completed_at);
   CREATE INDEX IF NOT EXISTS idx_google_events_account_start ON google_events(account_key, start_at);
   CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
+`);
+
+// Upgrade existing local databases without touching routines or completion history.
+const routineColumns = db.pragma('table_info(routines)');
+if (!routineColumns.some((column) => column.name === 'progressive')) {
+  db.exec('ALTER TABLE routines ADD COLUMN progressive INTEGER NOT NULL DEFAULT 0');
+}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS routine_calendar_events (
+    account_key TEXT NOT NULL REFERENCES google_accounts(account_key) ON DELETE CASCADE,
+    routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+    occurrence_key TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(account_key, routine_id, occurrence_key),
+    UNIQUE(account_key, event_id)
+  );
+  CREATE TABLE IF NOT EXISTS routine_create_requests (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    request_id TEXT NOT NULL,
+    routine_id TEXT NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, request_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_routine_calendar_routine ON routine_calendar_events(routine_id);
 `);
 
 function nowIso() { return new Date().toISOString(); }
@@ -318,7 +345,7 @@ const GOOGLE_SCOPES = [
   'email',
   'profile',
   'https://www.googleapis.com/auth/drive.file',
-  'https://www.googleapis.com/auth/calendar.events.readonly'
+  'https://www.googleapis.com/auth/calendar.events.owned'
 ];
 
 function persistAccountTokens(accountKey, tokens) {
@@ -371,6 +398,16 @@ function publicRoutine(routine, now = new Date()) {
     item.maximumReached = count >= routine.max_count;
     item.remainingMinimum = Math.max(0, routine.min_count - count);
     item.progress = Math.min(100, Math.round((count / Math.max(1, routine.max_count)) * 100));
+    item.progressive = Boolean(routine.progressive);
+    item.nextOccurrenceNumber = Math.min(routine.max_count, count + 1);
+    const periodDuration = Math.max(1, window.end.getTime() - window.start.getTime());
+    const offset = item.progressive ? ((item.nextOccurrenceNumber - 1) / Math.max(1, routine.max_count)) * periodDuration : 0;
+    const opportunityAt = new Date(window.start.getTime() + offset);
+    item.nextOpportunityAt = opportunityAt.toISOString();
+    item.checklistAvailable = !item.maximumReached && (!item.progressive || now.getTime() >= opportunityAt.getTime());
+    item.unlockedOccurrences = item.progressive
+      ? Math.min(routine.max_count, Math.max(0, Math.floor(((now.getTime() - window.start.getTime()) / periodDuration) * routine.max_count + 1e-9) + 1))
+      : routine.max_count;
     item.cadenceLabel = `${routine.min_count}${routine.max_count > routine.min_count ? `–${routine.max_count}` : ''} times every ${routine.period_value} ${unitLabel(routine.period_unit)}`;
   } else {
     const due = routine.next_due_at ? new Date(routine.next_due_at) : null;
@@ -413,7 +450,7 @@ function statsFor(userId, routines) {
   monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
   const completedThisMonth = db.prepare('SELECT COUNT(*) AS n FROM completions WHERE user_id = ? AND completed_at >= ?')
     .get(userId, monthStart.toISOString()).n;
-  const dueCount = routines.filter((r) => r.type === 'interval' ? r.isDue : !r.minimumReached).length;
+  const dueCount = routines.filter((r) => r.type === 'interval' ? r.isDue : r.checklistAvailable).length;
   const targetsMet = routines.filter((r) => r.type === 'frequency' && r.minimumReached).length;
   return { routineCount: routines.length, completedThisMonth, dueCount, targetsMet };
 }
@@ -523,7 +560,7 @@ async function restoreDriveBackup(userId) {
       const values = {
         id: targetId, user_id: userId, title: String(r.title).slice(0, 120), notes: String(r.notes || ''),
         color: r.color || 'lavender', type: r.type, min_count: r.min_count ?? null, max_count: r.max_count ?? null,
-        period_value: r.period_value ?? null, period_unit: r.period_unit ?? null,
+        period_value: r.period_value ?? null, period_unit: r.period_unit ?? null, progressive: r.progressive ? 1 : 0,
         interval_value: r.interval_value ?? null, interval_unit: r.interval_unit ?? null,
         start_at: r.start_at ?? null, last_completed_at: r.last_completed_at ?? null,
         next_due_at: r.next_due_at ?? null, archived: r.archived ? 1 : 0,
@@ -531,17 +568,17 @@ async function restoreDriveBackup(userId) {
       };
       if (existing && targetId === sourceId) {
         db.prepare(`UPDATE routines SET title=@title,notes=@notes,color=@color,type=@type,min_count=@min_count,
-          max_count=@max_count,period_value=@period_value,period_unit=@period_unit,interval_value=@interval_value,
+          max_count=@max_count,period_value=@period_value,period_unit=@period_unit,progressive=@progressive,interval_value=@interval_value,
           interval_unit=@interval_unit,start_at=@start_at,last_completed_at=@last_completed_at,next_due_at=@next_due_at,
           archived=@archived,updated_at=@updated_at WHERE id=@id AND user_id=@user_id AND updated_at < @updated_at`)
           .run(values);
       } else {
         db.prepare(`INSERT OR IGNORE INTO routines(
           id,user_id,title,notes,color,type,min_count,max_count,period_value,period_unit,
-          interval_value,interval_unit,start_at,last_completed_at,next_due_at,archived,created_at,updated_at
+          interval_value,interval_unit,start_at,last_completed_at,next_due_at,progressive,archived,created_at,updated_at
         ) VALUES(
           @id,@user_id,@title,@notes,@color,@type,@min_count,@max_count,@period_value,@period_unit,
-          @interval_value,@interval_unit,@start_at,@last_completed_at,@next_due_at,@archived,@created_at,@updated_at
+          @interval_value,@interval_unit,@start_at,@last_completed_at,@next_due_at,@progressive,@archived,@created_at,@updated_at
         )`).run(values);
       }
       routineCount++;
@@ -594,6 +631,7 @@ async function syncCalendarForAccount(accountKey, attempt = 0) {
       }
       for (const event of (response.data.items || [])) {
         if (!event.id) continue;
+        if (event.extendedProperties?.private?.routineTrackerManaged === '1') continue;
         if (event.status === 'cancelled') {
           db.prepare('DELETE FROM google_events WHERE account_key = ? AND event_id = ?').run(accountKey, event.id);
           continue;
@@ -625,6 +663,106 @@ async function syncCalendarForAccount(accountKey, attempt = 0) {
   }
 }
 
+
+const routineCalendarLocks = new Set();
+function dateOnlyUtc(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error('A valid Calendar task date is required.');
+  return date.toISOString().slice(0, 10);
+}
+function shiftDateOnly(dateOnly, days) {
+  const date = new Date(`${dateOnly}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return dateOnlyUtc(date);
+}
+async function syncRoutineCalendarForUser(userId, routineId) {
+  const routine = db.prepare('SELECT * FROM routines WHERE id = ? AND user_id = ?').get(routineId, userId);
+  if (!routine) return { skipped: true };
+  const account = getCurrentGoogleAccount(userId);
+  if (!account) return { skipped: true, reason: 'Google is not connected.' };
+  const lockKey = `${account.account_key}:${routine.id}`;
+  if (routineCalendarLocks.has(lockKey)) return { skipped: true };
+  routineCalendarLocks.add(lockKey);
+  try {
+    const calendar = calendarApi(account.account_key);
+    const targets = [];
+    if (!routine.archived && routine.type === 'interval' && routine.next_due_at) {
+      targets.push({ key: `interval:${routine.next_due_at}`, dueAt: routine.next_due_at, label: 'Repeat routine due' });
+    } else if (!routine.archived && routine.type === 'frequency') {
+      const view = publicRoutine(routine);
+      if (view.checklistAvailable) {
+        // The task is written to Google Calendar only once this particular
+        // check-in has unlocked in the Progressive checklist.
+        const dueAt = new Date(Math.max(Date.now(), new Date(view.nextOpportunityAt).getTime())).toISOString();
+        targets.push({ key: `frequency:${view.periodStart}:${view.nextOccurrenceNumber}`, dueAt, label: 'Routine check-in available' });
+      }
+    }
+    const existingRows = db.prepare('SELECT * FROM routine_calendar_events WHERE account_key = ? AND routine_id = ?')
+      .all(account.account_key, routine.id);
+    const desiredKeys = new Set(targets.map((target) => target.key));
+    for (const old of existingRows) {
+      if (desiredKeys.has(old.occurrence_key)) continue;
+      try { await calendar.events.delete({ calendarId: 'primary', eventId: old.event_id }); }
+      catch (error) { if (Number(error.code) !== 404 && Number(error.code) !== 410) throw error; }
+      db.prepare('DELETE FROM routine_calendar_events WHERE account_key = ? AND routine_id = ? AND occurrence_key = ?')
+        .run(account.account_key, routine.id, old.occurrence_key);
+    }
+    for (const target of targets) {
+      const row = db.prepare(`SELECT event_id FROM routine_calendar_events
+        WHERE account_key = ? AND routine_id = ? AND occurrence_key = ?`)
+        .get(account.account_key, routine.id, target.key);
+      const startDate = dateOnlyUtc(target.dueAt);
+      const endDate = shiftDateOnly(startDate, 1);
+      const requestBody = {
+        summary: `Routine · ${routine.title}`,
+        description: `${target.label}. Managed by Routine Tracker.
+
+${routine.notes || ''}`.trim(),
+        start: { date: startDate },
+        end: { date: endDate },
+        reminders: { useDefault: true },
+        extendedProperties: { private: { routineTrackerManaged: '1', routineId: routine.id, occurrenceKey: target.key } }
+      };
+      if (row) {
+        try {
+          await calendar.events.patch({ calendarId: 'primary', eventId: row.event_id, requestBody });
+          db.prepare('UPDATE routine_calendar_events SET due_at = ? WHERE account_key = ? AND routine_id = ? AND occurrence_key = ?')
+            .run(target.dueAt, account.account_key, routine.id, target.key);
+        } catch (error) {
+          if (Number(error.code) !== 404 && Number(error.code) !== 410) throw error;
+          const recreated = await calendar.events.insert({ calendarId: 'primary', requestBody });
+          if (!recreated.data.id) throw new Error(`Google Calendar did not return a replacement event ID for “${routine.title}”.`);
+          db.prepare('UPDATE routine_calendar_events SET event_id = ?, due_at = ? WHERE account_key = ? AND routine_id = ? AND occurrence_key = ?')
+            .run(recreated.data.id, target.dueAt, account.account_key, routine.id, target.key);
+        }
+      } else {
+        const created = await calendar.events.insert({ calendarId: 'primary', requestBody });
+        if (!created.data.id) throw new Error(`Google Calendar did not return an event ID for “${routine.title}”.`);
+        db.prepare(`INSERT INTO routine_calendar_events(account_key,routine_id,occurrence_key,event_id,due_at,created_at)
+          VALUES(?,?,?,?,?,?)`).run(account.account_key, routine.id, target.key, created.data.id, target.dueAt, nowIso());
+      }
+    }
+    db.prepare('UPDATE google_accounts SET last_error = NULL, updated_at = ? WHERE account_key = ?')
+      .run(nowIso(), account.account_key);
+    return { synced: true, count: targets.length };
+  } catch (error) {
+    db.prepare('UPDATE google_accounts SET last_error = ?, updated_at = ? WHERE account_key = ?')
+      .run(`Routine Calendar task sync: ${error.message}`, nowIso(), account.account_key);
+    throw error;
+  } finally {
+    routineCalendarLocks.delete(lockKey);
+  }
+}
+async function syncRoutineTasksForUser(userId) {
+  const rows = db.prepare('SELECT id FROM routines WHERE user_id = ?').all(userId);
+  const results = [];
+  for (const row of rows) {
+    try { results.push(await syncRoutineCalendarForUser(userId, row.id)); }
+    catch (error) { console.warn(`Could not sync Calendar task for ${row.id}:`, error.message); }
+  }
+  return results;
+}
+
 function parseRoutineBody(body, existing = null) {
   const type = body.type || (existing && existing.type);
   if (!['frequency', 'interval'].includes(type)) throw new Error('Choose a valid routine type.');
@@ -633,6 +771,7 @@ function parseRoutineBody(body, existing = null) {
   const colorOptions = ['lavender', 'mint', 'peach', 'blue', 'rose', 'gold'];
   const color = colorOptions.includes(body.color || existing?.color) ? (body.color || existing.color) : 'lavender';
   const common = { title, notes: String(body.notes ?? existing?.notes ?? '').trim().slice(0, 1200), color, type };
+  const progressive = body.progressive === undefined ? Boolean(existing?.progressive) : (body.progressive === true || body.progressive === 1 || body.progressive === '1' || body.progressive === 'true');
   if (type === 'frequency') {
     const minCount = Number(body.minCount ?? existing?.min_count ?? 2);
     const maxCount = Number(body.maxCount ?? existing?.max_count ?? minCount);
@@ -643,7 +782,7 @@ function parseRoutineBody(body, existing = null) {
     if (!Number.isInteger(periodValue) || periodValue < 1 || periodValue > 365) throw new Error('Frequency period must be from 1 to 365.');
     if (!['days', 'weeks', 'months'].includes(periodUnit)) throw new Error('Choose a valid frequency period.');
     const startAt = toIso(body.startAt ?? existing?.start_at, nowIso());
-    return { ...common, min_count: minCount, max_count: maxCount, period_value: periodValue, period_unit: periodUnit,
+    return { ...common, progressive: progressive ? 1 : 0, min_count: minCount, max_count: maxCount, period_value: periodValue, period_unit: periodUnit,
       interval_value: null, interval_unit: null, start_at: startAt,
       last_completed_at: null, next_due_at: null };
   }
@@ -657,7 +796,7 @@ function parseRoutineBody(body, existing = null) {
   let nextDueAt;
   if (lastCompletedAt) nextDueAt = addInterval(lastCompletedAt, intervalValue, intervalUnit).toISOString();
   else nextDueAt = toIso(body.nextDueAt ?? existing?.next_due_at, nowIso());
-  return { ...common, min_count: null, max_count: null, period_value: null, period_unit: null,
+  return { ...common, progressive: 0, min_count: null, max_count: null, period_value: null, period_unit: null,
     interval_value: intervalValue, interval_unit: intervalUnit, start_at: null,
     last_completed_at: lastCompletedAt, next_due_at: nextDueAt };
 }
@@ -734,6 +873,7 @@ app.get('/auth/google/callback', async (req, res, next) => {
     req.session.save(async (saveError) => {
       if (saveError) return next(saveError);
       syncCalendarForAccount(accountKey).catch((error) => console.warn('Initial Calendar sync failed:', error.message));
+      syncRoutineTasksForUser(canonicalUserId).catch((error) => console.warn('Initial routine Calendar task sync failed:', error.message));
       queueDriveSync(canonicalUserId);
       res.redirect('/?connected=1');
     });
@@ -759,16 +899,30 @@ app.get('/api/routines', (req, res) => res.json({ routines: listRoutines(req.use
 app.post('/api/routines', (req, res) => {
   try {
     const data = parseRoutineBody(req.body);
+    const requestId = String(req.body.requestId || '').trim().slice(0, 100);
+    if (requestId) {
+      const previous = db.prepare('SELECT routine_id FROM routine_create_requests WHERE user_id = ? AND request_id = ?').get(req.userId, requestId);
+      if (previous) {
+        const existing = db.prepare('SELECT * FROM routines WHERE id = ? AND user_id = ?').get(previous.routine_id, req.userId);
+        if (existing) return res.status(200).json({ routine: publicRoutine(existing), duplicateRequest: true });
+      }
+    }
     const id = makeId('routine');
     const stamp = nowIso();
-    db.prepare(`INSERT INTO routines(
-      id,user_id,title,notes,color,type,min_count,max_count,period_value,period_unit,
-      interval_value,interval_unit,start_at,last_completed_at,next_due_at,created_at,updated_at
-    ) VALUES(
-      @id,@user_id,@title,@notes,@color,@type,@min_count,@max_count,@period_value,@period_unit,
-      @interval_value,@interval_unit,@start_at,@last_completed_at,@next_due_at,@created_at,@updated_at
-    )`).run({ id, user_id: req.userId, ...data, created_at: stamp, updated_at: stamp });
+    const createTransaction = db.transaction(() => {
+      db.prepare(`INSERT INTO routines(
+        id,user_id,title,notes,color,type,min_count,max_count,period_value,period_unit,progressive,
+        interval_value,interval_unit,start_at,last_completed_at,next_due_at,created_at,updated_at
+      ) VALUES(
+        @id,@user_id,@title,@notes,@color,@type,@min_count,@max_count,@period_value,@period_unit,@progressive,
+        @interval_value,@interval_unit,@start_at,@last_completed_at,@next_due_at,@created_at,@updated_at
+      )`).run({ id, user_id: req.userId, ...data, created_at: stamp, updated_at: stamp });
+      if (requestId) db.prepare('INSERT OR IGNORE INTO routine_create_requests(user_id,request_id,routine_id,created_at) VALUES(?,?,?,?)')
+        .run(req.userId, requestId, id, stamp);
+    });
+    createTransaction();
     queueDriveSync(req.userId);
+    syncRoutineCalendarForUser(req.userId, id).catch((error) => console.warn('Routine Calendar task sync failed:', error.message));
     res.status(201).json({ routine: publicRoutine(db.prepare('SELECT * FROM routines WHERE id = ?').get(id)) });
   } catch (error) { res.status(400).json({ error: error.message }); }
 });
@@ -778,10 +932,11 @@ app.patch('/api/routines/:id', (req, res) => {
     if (!existing) return res.status(404).json({ error: 'Routine not found.' });
     const data = parseRoutineBody({ ...req.body, type: existing.type }, existing);
     db.prepare(`UPDATE routines SET title=@title,notes=@notes,color=@color,min_count=@min_count,max_count=@max_count,
-      period_value=@period_value,period_unit=@period_unit,interval_value=@interval_value,interval_unit=@interval_unit,
+      period_value=@period_value,period_unit=@period_unit,progressive=@progressive,interval_value=@interval_value,interval_unit=@interval_unit,
       start_at=@start_at,last_completed_at=@last_completed_at,next_due_at=@next_due_at,updated_at=@updated_at
       WHERE id=@id AND user_id=@user_id`).run({ ...data, updated_at: nowIso(), id: existing.id, user_id: req.userId });
     queueDriveSync(req.userId);
+    syncRoutineCalendarForUser(req.userId, existing.id).catch((error) => console.warn('Routine Calendar task sync failed:', error.message));
     res.json({ routine: publicRoutine(db.prepare('SELECT * FROM routines WHERE id = ?').get(existing.id)) });
   } catch (error) { res.status(400).json({ error: error.message }); }
 });
@@ -790,6 +945,7 @@ app.delete('/api/routines/:id', (req, res) => {
     .run(nowIso(), req.params.id, req.userId);
   if (!result.changes) return res.status(404).json({ error: 'Routine not found.' });
   queueDriveSync(req.userId);
+  syncRoutineCalendarForUser(req.userId, req.params.id).catch((error) => console.warn('Routine Calendar cleanup failed:', error.message));
   res.json({ ok: true });
 });
 app.post('/api/routines/:id/complete', (req, res) => {
@@ -808,6 +964,7 @@ app.post('/api/routines/:id/complete', (req, res) => {
       db.prepare('UPDATE routines SET updated_at=? WHERE id=?').run(nowIso(), routine.id);
     }
     queueDriveSync(req.userId);
+    syncRoutineCalendarForUser(req.userId, routine.id).catch((error) => console.warn('Routine Calendar task refresh failed:', error.message));
     const updated = db.prepare('SELECT * FROM routines WHERE id = ?').get(routine.id);
     res.json({ routine: publicRoutine(updated), completion: { id: completionId, completedAt } });
   } catch (error) { res.status(400).json({ error: error.message }); }
@@ -850,11 +1007,11 @@ app.get('/api/calendar', async (req, res) => {
         const due = new Date(r.next_due_at);
         if (due >= start && due < end) events.push({ id: `due_${r.id}`, title: `${r.title} · due`, start: r.next_due_at, allDay: false, kind: 'due', routineId: r.id, color: r.color });
       }
-      if (r.type === 'frequency') {
-        const deadline = new Date(r.periodEnd);
-        const dueMarker = new Date(deadline.getTime() - 60 * 60 * 1000);
-        if (!r.minimumReached && dueMarker >= start && dueMarker < end) {
-          events.push({ id: `target_${r.id}`, title: `${r.title} · minimum target`, start: dueMarker.toISOString(), allDay: false, kind: 'target', routineId: r.id, color: r.color });
+      if (r.type === 'frequency' && r.checklistAvailable && r.nextOpportunityAt) {
+        const scheduledAt = new Date(r.nextOpportunityAt);
+        const availableAt = new Date(Math.max(Date.now(), scheduledAt.getTime()));
+        if (availableAt >= start && availableAt < end) {
+          events.push({ id: `freq_${r.id}_${r.nextOccurrenceNumber}`, title: `${r.title} · check-in available`, start: availableAt.toISOString(), allDay: true, kind: 'due', routineId: r.id, color: r.color });
         }
       }
     }
@@ -873,6 +1030,7 @@ app.post('/api/google/sync-calendar', async (req, res) => {
     const account = getCurrentGoogleAccount(req.userId);
     if (!account) return res.status(400).json({ error: 'Connect Google first.' });
     const result = await syncCalendarForAccount(account.account_key);
+    await syncRoutineTasksForUser(req.userId);
     res.json({ ok: true, result, google: googleStatus(req.userId) });
   } catch (error) { res.status(502).json({ error: error.message }); }
 });
@@ -919,6 +1077,16 @@ const calendarTimer = setInterval(() => {
   }
 }, Math.max(60000, CALENDAR_SYNC_INTERVAL_MS));
 if (calendarTimer.unref) calendarTimer.unref();
+
+// Progressive frequency opportunities are checked once a minute. Events are
+// created only after the matching checklist row becomes available.
+const routineTaskTimer = setInterval(() => {
+  const users = db.prepare('SELECT id FROM users WHERE google_account_key IS NOT NULL').all();
+  for (const user of users) {
+    syncRoutineTasksForUser(user.id).catch((error) => console.warn('Routine task scheduler failed:', error.message));
+  }
+}, 60000);
+if (routineTaskTimer.unref) routineTaskTimer.unref();
 
 // Remove expired browser sessions periodically. The browser cookie is long-lived,
 // while server-side sessions are persistent and renewed on visits.
