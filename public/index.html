@@ -26,24 +26,21 @@
       </nav>
 
       <div class="sidebar-bottom">
-        <button class="nav-item settings-nav" data-page="settings"><span class="nav-icon">⚙</span><span>Settings & sync</span></button>
-        <div class="profile-mini" id="sidebarProfile">
+        <button class="profile-mini profile-settings-trigger" id="sidebarProfile" type="button" aria-label="Open profile settings">
           <div class="avatar" id="sidebarAvatar">Y</div>
           <div class="profile-copy"><strong id="sidebarName">Your space</strong><small id="sidebarEmail">Local workspace</small></div>
-        </div>
+        </button>
       </div>
     </aside>
 
     <main class="main-content">
       <header class="topbar">
         <button class="icon-button mobile-menu" id="mobileMenuButton" aria-label="Open navigation menu" aria-controls="sidebar" aria-expanded="false">☰</button>
-        <button class="mobile-header-profile" id="mobileProfileButton" type="button" aria-label="Open profile and account settings">
+        <button class="mobile-profile-button" id="mobileProfileButton" type="button" aria-label="Open profile settings">
           <span class="top-avatar" id="mobileHeaderAvatar">Y</span>
-          <span class="mobile-header-user"><strong id="mobileHeaderName">Your space</strong><small id="mobileHeaderEmail">Local workspace</small></span>
         </button>
         <div class="breadcrumb"><strong id="breadcrumbCurrent">Overview</strong></div>
         <div class="topbar-actions">
-          <button class="icon-button mobile-header-settings" id="mobileSettingsButton" type="button" aria-label="Open settings">⚙</button>
           <div class="sync-indicator" id="syncIndicator"><span class="sync-dot"></span><span id="syncText">Saved on this server</span></div>
         </div>
       </header>
@@ -67,7 +64,6 @@
           <button class="subtle-button" data-go-page="routines">Manage routines <span>→</span></button>
         </div>
         <div class="routine-grid" id="dashboardRoutineGrid"></div>
-        <div class="bottom-note"><span class="note-star">✳</span><span>Progress isn't always a straight line. Keep showing up.</span><span class="note-line"></span></div>
       </section>
 
       <section class="page-view" id="page-calendar">
@@ -117,7 +113,7 @@
               <p class="settings-hint">Changes are backed up automatically after a short pause. Restore merges saved items into this workspace; it doesn't delete your current routines.</p>
             </article>
             <article class="settings-card">
-              <div class="settings-card-top"><div class="settings-icon calendar-icon">▦</div><div><h2>Google Calendar</h2><p>Add due checklist tasks and repeat-after schedules to your primary Google Calendar.</p></div><span class="small-status" id="calendarStatus">Not connected</span></div>
+              <div class="settings-card-top"><div class="settings-icon calendar-icon">▦</div><div><h2>Google Tasks & Calendar</h2><p>Routine checklist items sync as Google Tasks. Your primary Google Calendar events remain visible in the in-app calendar.</p></div><span class="small-status" id="calendarStatus">Not connected</span></div>
               <div class="calendar-sync-info"><span class="pulse-indicator"></span><span id="calendarSyncText">Connect Google to start syncing your primary calendar.</span></div>
               <div class="settings-actions"><button class="secondary-button" id="calendarSyncButton" disabled>Refresh calendar <span>↻</span></button><button class="text-only-button" data-go-page="calendar">Open calendar <span>→</span></button></div>
             </article>
@@ -151,16 +147,28 @@
           <div class="inline-fields period-fields"><div><label for="periodValue">Every</label><input class="text-input" type="number" id="periodValue" min="1" max="365" value="1"></div><div><label for="periodUnit">Period</label><select class="text-input" id="periodUnit"><option value="weeks">Week(s)</option><option value="days">Day(s)</option><option value="months">Month(s)</option></select></div></div>
           <div class="field-hint">For example, 2–3 times every 1 week. Your progress resets when the next period begins.</div>
           <label class="progressive-option" for="progressive"><input type="checkbox" id="progressive" checked><span><strong>Progressive</strong><small>Unlock one checklist check-in at a time, spaced evenly across the period. A 3-times-per-week target unlocks at 0%, 33% and 67% of the week.</small></span></label>
-          <label class="field-label" for="startAt">Start tracking from</label><input class="text-input" type="date" id="startAt">
+          <label class="field-label" for="startAt">Start tracking from</label><input class="text-input date-keyboard" type="text" id="startAt" data-date-field inputmode="numeric" autocomplete="off" placeholder="DD-MM-YYYY" aria-label="Start tracking date">
         </div>
 
         <div id="intervalFields" class="rule-fields" hidden>
-          <div class="field-label">Repeat after</div>
-          <div class="inline-fields period-fields"><div><label for="intervalValue">Every</label><input class="text-input" type="number" id="intervalValue" min="1" max="3650" value="2"></div><div><label for="intervalUnit">Period</label><select class="text-input" id="intervalUnit"><option value="weeks">Week(s)</option><option value="days">Day(s)</option><option value="months">Month(s)</option><option value="years">Year(s)</option></select></div></div>
-          <label class="check-line"><input type="checkbox" id="hasLastDone" checked><span>I have already completed this routine</span></label>
-          <div id="lastDoneWrap"><label class="field-label" for="lastCompletedAt">Last completed on</label><input class="text-input" type="date" id="lastCompletedAt"></div>
-          <div id="firstDueWrap" hidden><label class="field-label" for="firstDueAt">First due date</label><input class="text-input" type="date" id="firstDueAt"></div>
-          <div class="field-hint">The next date is always calculated from the day you actually mark it complete—even when it is late.</div>
+          <label class="check-line link-routine-toggle"><input type="checkbox" id="linkedEnabled"><span><strong>Linked routine</strong><small>Schedule this routine in relation to another routine.</small></span></label>
+          <div id="linkedFields" class="linked-fields" hidden>
+            <label class="field-label" for="linkedRoutine">Link to routine</label>
+            <select class="text-input" id="linkedRoutine"><option value="">Choose a repeat-after routine</option></select>
+            <div class="inline-fields linked-offset-row">
+              <div><label for="linkedDirection">Schedule</label><select class="text-input" id="linkedDirection"><option value="before">Before</option><option value="after">After</option></select></div>
+              <div><label for="linkedDays">Number of days</label><input class="text-input" type="number" id="linkedDays" min="0" max="3650" value="1"></div>
+            </div>
+            <div class="field-hint">Example: use rosemary water 1 day before your Bath routine is due. When Bath is completed, the linked date moves with its next schedule.</div>
+          </div>
+          <div id="intervalRegularFields">
+            <div class="field-label">Repeat after</div>
+            <div class="inline-fields period-fields"><div><label for="intervalValue">Every</label><input class="text-input" type="number" id="intervalValue" min="1" max="3650" value="2"></div><div><label for="intervalUnit">Period</label><select class="text-input" id="intervalUnit"><option value="weeks">Week(s)</option><option value="days">Day(s)</option><option value="months">Month(s)</option><option value="years">Year(s)</option></select></div></div>
+            <label class="check-line"><input type="checkbox" id="hasLastDone" checked><span>I have already completed this routine</span></label>
+            <div id="lastDoneWrap"><label class="field-label" for="lastCompletedAt">Last completed on</label><input class="text-input date-keyboard" type="text" id="lastCompletedAt" data-date-field inputmode="numeric" autocomplete="off" placeholder="DD-MM-YYYY" aria-label="Last completed date"></div>
+            <div id="firstDueWrap" hidden><label class="field-label" for="firstDueAt">First due date</label><input class="text-input date-keyboard" type="text" id="firstDueAt" data-date-field inputmode="numeric" autocomplete="off" placeholder="DD-MM-YYYY" aria-label="First due date"></div>
+            <div class="field-hint">The next date is always calculated from the day you actually mark it complete—even when it is late.</div>
+          </div>
         </div>
 
         <div class="field-label color-field-label">Choose a mood</div><div class="color-options" id="colorOptions"><button type="button" class="color-choice lavender selected" data-color="lavender" aria-label="Lavender"></button><button type="button" class="color-choice mint" data-color="mint" aria-label="Mint"></button><button type="button" class="color-choice peach" data-color="peach" aria-label="Peach"></button><button type="button" class="color-choice blue" data-color="blue" aria-label="Blue"></button><button type="button" class="color-choice rose" data-color="rose" aria-label="Rose"></button><button type="button" class="color-choice gold" data-color="gold" aria-label="Gold"></button></div>
@@ -169,12 +177,25 @@
     </div>
   </div>
 
+  <div class="modal-backdrop" id="calendarEventModal" hidden>
+    <div class="calendar-event-modal" role="dialog" aria-modal="true" aria-labelledby="calendarEventTitle">
+      <div class="modal-header"><div><div class="eyebrow">CALENDAR ITEM</div><h2 id="calendarEventTitle">Routine task</h2><p id="calendarEventDescription">Manage this task or activity.</p></div><button class="modal-close" id="closeCalendarEventModal" aria-label="Close">×</button></div>
+      <label class="field-label" for="calendarActionDate" id="calendarActionDateLabel">Scheduled date</label>
+      <input class="text-input date-keyboard" type="text" id="calendarActionDate" data-date-field inputmode="numeric" autocomplete="off" placeholder="DD-MM-YYYY" aria-label="Task or completion date">
+      <div class="calendar-event-actions">
+        <button class="primary-button" id="calendarEventComplete" type="button">Mark complete</button>
+        <button class="secondary-button" id="calendarEventSaveDate" type="button">Save date</button>
+        <button class="quiet-danger-button" id="calendarEventDelete" type="button">Delete activity</button>
+        <a class="text-only-button" id="calendarEventOpen" href="#" target="_blank" rel="noopener" hidden>Open Google event ↗</a>
+      </div>
+    </div>
+  </div>
+
   <nav class="mobile-bottom-nav" aria-label="Mobile navigation">
     <button class="mobile-nav-item active" data-page="dashboard"><span>◫</span><small>Home</small></button>
     <button class="mobile-nav-item" data-page="calendar"><span>▦</span><small>Calendar</small></button>
     <button class="mobile-nav-item" data-page="routines"><span>◉</span><small>Routines</small></button>
     <button class="mobile-nav-item" data-page="history"><span>↗</span><small>Activity</small></button>
-    <button class="mobile-nav-item" data-page="settings"><span>⚙</span><small>Settings</small></button>
   </nav>
 
   <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
