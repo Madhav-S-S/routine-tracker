@@ -71,13 +71,15 @@
       </section>
 
       <section class="page-view" id="page-calendar">
-        <div class="page-heading-row">
+        <div class="page-heading-row calendar-page-heading">
           <div><div class="eyebrow">SEE THE SHAPE OF YOUR DAYS</div><h1>Your calendar</h1><p class="page-subtitle">Your routines and Google Calendar, together in one view. Select any date to see every task and event with details.</p></div>
-          <button class="primary-button" id="calendarNewButton"><span class="button-plus">＋</span> New routine</button>
         </div>
         <div class="calendar-toolbar">
           <div class="calendar-month-title"><button class="icon-button" id="calendarPrev" aria-label="Previous month">←</button><h2 id="calendarMonthTitle">Month 2026</h2><button class="icon-button" id="calendarNext" aria-label="Next month">→</button></div>
-          <div class="calendar-legend"><span><i class="legend-dot due-dot"></i>Routine due</span><span><i class="legend-dot done-dot"></i>Completed</span><span><i class="legend-dot google-dot"></i>Google event</span></div>
+          <div class="calendar-toolbar-actions">
+            <button class="primary-button" id="calendarNewButton"><span class="button-plus">＋</span> New routine</button>
+            <div class="calendar-legend"><span><i class="legend-dot due-dot"></i>Routine due</span><span><i class="legend-dot done-dot"></i>Completed</span><span><i class="legend-dot google-dot"></i>Google event</span></div>
+          </div>
         </div>
         <div class="calendar-card">
           <div class="calendar-weekdays"><span>MON</span><span>TUE</span><span>WED</span><span>THU</span><span>FRI</span><span>SAT</span><span>SUN</span></div>
@@ -96,11 +98,10 @@
       </section>
 
       <section class="page-view" id="page-routines">
-        <div class="page-heading-row">
+        <div class="page-heading-row routines-page-heading">
           <div><div class="eyebrow">YOUR PERSONAL SYSTEM</div><h1>All routines</h1><p class="page-subtitle">A gentle structure for the things you want to keep doing.</p></div>
-          <button class="primary-button" id="routinesNewButton"><span class="button-plus">＋</span> New routine</button>
         </div>
-        <div class="filter-row"><div class="filter-pills" id="routineFilters"><button class="filter-pill active" data-filter="all">All routines</button><button class="filter-pill" data-filter="frequency">Frequency</button><button class="filter-pill" data-filter="interval">Repeat after</button></div><span class="result-count" id="routineResultCount">0 routines</span></div>
+        <div class="filter-row"><div class="filter-pills" id="routineFilters"><button class="filter-pill active" data-filter="all">All routines</button><button class="filter-pill" data-filter="frequency">Frequency</button><button class="filter-pill" data-filter="interval">Repeat after</button></div><div class="filter-actions"><button class="primary-button routines-new-inline" id="routinesNewButton"><span class="button-plus">＋</span><span class="routines-new-label">New</span></button><span class="result-count" id="routineResultCount">0 routines</span></div></div>
         <div class="routine-grid all-routines-grid" id="allRoutineGrid"></div>
       </section>
 
