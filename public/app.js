@@ -473,7 +473,11 @@ function calendarEventDetailText(event) {
 function renderCalendarDayDetails() {
   const panel = $('#calendarDayPanel');
   const key = state.selectedCalendarDate;
-  if (!panel || !key) { if (panel) panel.hidden = true; return; }
+  if (!panel || !key) {
+    if (panel) panel.hidden = true;
+    if ($('#calendarEventModal')?.hidden && $('#routineModal')?.hidden) document.body.style.overflow = '';
+    return;
+  }
   const date = new Date(`${key}T12:00:00`);
   const events = calendarEventsForDate(key);
   $('#calendarSelectedDateTitle').textContent = formatLongDate(date);
@@ -485,12 +489,36 @@ function renderCalendarDayDetails() {
       const routine = state.routines.find((item) => item.id === event.routineId);
       const accent = event.color || routine?.color || '#9a88db';
       const detail = calendarEventDetailText(event);
+      const eventId = escapeHtml(event.id);
+      const eventDate = dateKey(event.start);
+      const isCompletion = event.kind === 'completion' && event.completionId;
+      const isRoutineTask = ['due', 'frequency'].includes(event.kind) && event.routineId;
+      const canEditDate = Boolean(isCompletion || (event.kind === 'due' && !event.linked));
+      const canDelete = Boolean(isCompletion || isRoutineTask);
+      const canComplete = Boolean(isRoutineTask && event.available !== false);
       const googleLink = event.kind === 'google' && event.url
         ? `<a class="calendar-day-open-link" href="${escapeHtml(event.url)}" target="_blank" rel="noopener">Open in Google ↗</a>` : '';
-      return `<article class="calendar-day-item" style="--day-item-accent:${escapeHtml(accent)}"><button type="button" class="calendar-day-item-main" data-calendar-event="${escapeHtml(event.id)}" aria-label="View details for ${escapeHtml(event.title)}"><span class="calendar-day-item-marker" aria-hidden="true"></span><span class="calendar-day-item-copy"><span class="calendar-day-item-heading"><strong>${escapeHtml(event.title)}</strong><small>${escapeHtml(calendarKindLabel(event))}</small></span><span class="calendar-day-item-detail">${escapeHtml(detail)}</span></span><span class="calendar-day-item-time">${escapeHtml(calendarTimeLabel(event))}<span>Details ↗</span></span></button>${googleLink}</article>`;
+      const dateControl = canEditDate
+        ? `<label class="calendar-day-date-control"><span>${isCompletion ? 'Completed' : 'Due date'}</span><input type="date" value="${escapeHtml(eventDate)}" data-calendar-day-date="${eventId}" aria-label="Edit ${isCompletion ? 'completion' : 'due'} date for ${escapeHtml(event.title)}"></label>`
+        : `<span class="calendar-day-date-label">${escapeHtml(calendarTimeLabel(event))}</span>`;
+      const tickControl = canComplete
+        ? `<button type="button" class="calendar-row-action calendar-row-tick" data-calendar-day-complete="${eventId}" aria-label="Complete ${escapeHtml(event.title)}" title="Complete"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4.2 4.2L19 6.5"></path></svg></button>`
+        : isCompletion
+          ? `<span class="calendar-row-completed" aria-label="Completed" title="Completed"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4.2 4.2L19 6.5"></path></svg></span>` : '';
+      const deleteControl = canDelete
+        ? `<button type="button" class="calendar-row-action calendar-row-delete" data-calendar-day-delete="${eventId}" aria-label="Delete ${isCompletion ? 'activity' : 'task'} ${escapeHtml(event.title)}" title="Delete"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"></path></svg></button>` : '';
+      return `<article class="calendar-day-item" style="--day-item-accent:${escapeHtml(accent)}"><button type="button" class="calendar-day-item-main" data-calendar-event="${eventId}" aria-label="View details for ${escapeHtml(event.title)}"><span class="calendar-day-item-marker" aria-hidden="true"></span><span class="calendar-day-item-copy"><span class="calendar-day-item-heading"><strong>${escapeHtml(event.title)}</strong><small>${escapeHtml(calendarKindLabel(event))} · ${escapeHtml(calendarTimeLabel(event))}</small></span><span class="calendar-day-item-detail">${escapeHtml(detail)}</span></span></button><div class="calendar-day-item-actions">${dateControl}${deleteControl}${tickControl}${googleLink}</div></article>`;
     }).join('');
   }
   panel.hidden = false;
+  document.body.style.overflow = 'hidden';
+}
+function closeCalendarDayPanel() {
+  state.selectedCalendarDate = null;
+  const panel = $('#calendarDayPanel');
+  if (panel) panel.hidden = true;
+  renderCalendarGrid();
+  if ($('#calendarEventModal')?.hidden && $('#routineModal')?.hidden) document.body.style.overflow = '';
 }
 function selectCalendarDate(key) {
   const [year, month] = key.split('-').map(Number);
@@ -500,9 +528,55 @@ function selectCalendarDate(key) {
     loadCalendar();
     return;
   }
-  state.selectedCalendarDate = state.selectedCalendarDate === key ? null : key;
+  if (state.selectedCalendarDate === key) {
+    closeCalendarDayPanel();
+    return;
+  }
+  state.selectedCalendarDate = key;
   renderCalendarGrid();
-  if (state.selectedCalendarDate) $('#calendarDayPanel')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+async function saveCalendarDayItemDate(eventId, rawDate) {
+  const item = state.calendarEvents.find((row) => row.id === eventId);
+  const dateIso = dateInputToIso(rawDate);
+  if (!item || !dateIso) return toast('Choose a valid date.', 'error');
+  try {
+    if (item.kind === 'completion' && item.completionId) {
+      await api(`/api/completions/${encodeURIComponent(item.completionId)}`, { method: 'PATCH', body: JSON.stringify({ completedAt: dateIso }) });
+    } else if (item.kind === 'due' && !item.linked) {
+      await api(`/api/routines/${encodeURIComponent(item.routineId)}/reschedule`, { method: 'PATCH', body: JSON.stringify({ nextDueAt: dateIso }) });
+    } else {
+      return toast('This date is controlled by its linked or frequency schedule.', 'error');
+    }
+    await loadBootstrap();
+    await loadCalendar();
+    await loadHistory();
+    toast(item.kind === 'completion' ? 'Completion date updated.' : 'Task date updated.');
+  } catch (error) { toast(error.message, 'error'); }
+}
+async function completeCalendarDayItem(eventId) {
+  const item = state.calendarEvents.find((row) => row.id === eventId);
+  if (!item || !item.routineId || !['due', 'frequency'].includes(item.kind)) return;
+  if (item.available === false) return toast('This task is not available yet.', 'error');
+  await completeRoutine(item.routineId);
+}
+async function deleteCalendarDayItem(eventId) {
+  const item = state.calendarEvents.find((row) => row.id === eventId);
+  if (!item) return;
+  const isCompletion = item.kind === 'completion' && item.completionId;
+  const isRoutineTask = ['due', 'frequency'].includes(item.kind) && item.routineId;
+  if (!isCompletion && !isRoutineTask) return;
+  if (!confirm(isCompletion ? 'Delete this activity and its matching Google Task?' : 'Delete this scheduled task and its matching Google Task? The routine itself will remain.')) return;
+  try {
+    if (isCompletion) {
+      await api(`/api/history/${encodeURIComponent(item.completionId)}`, { method: 'DELETE' });
+    } else {
+      await api(`/api/routines/${encodeURIComponent(item.routineId)}/task`, { method: 'DELETE' });
+    }
+    await loadBootstrap();
+    await loadCalendar();
+    await loadHistory();
+    toast(isCompletion ? 'Activity deleted.' : 'Scheduled task deleted.');
+  } catch (error) { toast(error.message, 'error'); }
 }
 function renderCalendarGrid() {
   const first = new Date(state.calendarMonth.getFullYear(), state.calendarMonth.getMonth(), 1);
@@ -521,7 +595,8 @@ function renderCalendarGrid() {
     const day = new Date(gridStart.getFullYear(), gridStart.getMonth(), gridStart.getDate() + i);
     const key = localDateInput(day);
     const events = (grouped.get(key) || []).sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
-    const visible = events.slice(0, 2);
+    const visibleLimit = window.matchMedia('(max-width: 680px)').matches ? 2 : 4;
+    const visible = events.slice(0, visibleLimit);
     const more = events.length - visible.length;
     const eventMarkup = visible.map((event) => `<button type="button" class="calendar-event ${escapeHtml(event.kind)}" data-calendar-event="${escapeHtml(event.id)}" title="Open ${escapeHtml(event.title)}">${escapeHtml(event.title)}</button>`).join('');
     cells.push(`<div data-calendar-date="${key}" class="calendar-day ${day.getMonth() !== state.calendarMonth.getMonth() ? 'outside' : ''} ${key === todayKey ? 'today' : ''} ${state.selectedCalendarDate === key ? 'selected' : ''}"><button type="button" class="day-number day-select" data-calendar-date="${key}" aria-label="Show ${events.length} tasks and events for ${escapeHtml(formatLongDate(day))}" aria-pressed="${state.selectedCalendarDate === key}">${day.getDate()}</button>${eventMarkup}${more > 0 ? `<div class="calendar-more">+${more} more · select date</div>` : events.length ? '<div class="calendar-day-hint">Select date for details</div>' : ''}</div>`);
@@ -724,7 +799,7 @@ function openCalendarEvent(event) {
 function closeCalendarEvent() {
   $('#calendarEventModal').hidden = true;
   state.selectedCalendarEvent = null;
-  if ($('#routineModal').hidden) document.body.style.overflow = '';
+  if ($('#routineModal').hidden && $('#calendarDayPanel').hidden) document.body.style.overflow = '';
 }
 async function saveCalendarEventDate() {
   const event = state.selectedCalendarEvent;
@@ -958,6 +1033,18 @@ function installHandlers() {
   $('#mobileProfileButton')?.addEventListener('click', () => setPage('settings'));
   $('#sidebarProfile')?.addEventListener('click', () => setPage('settings'));
   const handleCalendarSelection = (event) => {
+    const completeButton = event.target.closest('[data-calendar-day-complete]');
+    if (completeButton) {
+      event.preventDefault(); event.stopPropagation();
+      completeCalendarDayItem(completeButton.dataset.calendarDayComplete);
+      return;
+    }
+    const deleteButton = event.target.closest('[data-calendar-day-delete]');
+    if (deleteButton) {
+      event.preventDefault(); event.stopPropagation();
+      deleteCalendarDayItem(deleteButton.dataset.calendarDayDelete);
+      return;
+    }
     const eventButton = event.target.closest('[data-calendar-event]');
     if (eventButton) {
       event.stopPropagation();
@@ -970,13 +1057,15 @@ function installHandlers() {
   };
   $('#calendarGrid').addEventListener('click', handleCalendarSelection);
   $('#calendarDayItems').addEventListener('click', handleCalendarSelection);
-  $('#closeCalendarDayPanel').addEventListener('click', () => { state.selectedCalendarDate = null; renderCalendarGrid(); });
+  $('#calendarDayItems').addEventListener('change', (event) => { const input = event.target.closest('[data-calendar-day-date]'); if (input) saveCalendarDayItemDate(input.dataset.calendarDayDate, input.value); });
+  $('#closeCalendarDayPanel').addEventListener('click', closeCalendarDayPanel);
+  $('#calendarDayPanel').addEventListener('click', (event) => { if (event.target === $('#calendarDayPanel')) closeCalendarDayPanel(); });
   $('#closeCalendarEventModal').addEventListener('click', closeCalendarEvent);
   $('#calendarEventModal').addEventListener('click', (event) => { if (event.target === $('#calendarEventModal')) closeCalendarEvent(); });
   $('#calendarEventComplete').addEventListener('click', completeCalendarEvent);
   $('#calendarEventSaveDate').addEventListener('click', saveCalendarEventDate);
   $('#calendarEventDelete').addEventListener('click', deleteCalendarActivity);
-  document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { if (!$('#calendarEventModal').hidden) closeCalendarEvent(); else if (!$('#routineModal').hidden) closeRoutineModal(); } });
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { if (!$('#calendarEventModal').hidden) closeCalendarEvent(); else if (!$('#routineModal').hidden) closeRoutineModal(); else if (!$('#calendarDayPanel').hidden) closeCalendarDayPanel(); } });
 }
 
 async function init() {
