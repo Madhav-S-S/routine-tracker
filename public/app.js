@@ -936,19 +936,60 @@ async function deleteCalendarActivity() {
 
 function renderDatePopover(input, popover) {
   const key = parseDateText(input.value) || localDateInput();
-  const [y, m] = (popover.dataset.month || key).split('-').map(Number);
-  const first = new Date(y, m - 1, 1);
+  const [y, m] = (popover.dataset.month || key.slice(0, 7)).split('-').map(Number);
+  const safeYear = Math.min(2100, Math.max(1900, Number.isFinite(y) ? y : new Date().getFullYear()));
+  const safeMonth = Math.min(12, Math.max(1, Number.isFinite(m) ? m : 1));
+  const first = new Date(safeYear, safeMonth - 1, 1);
   const offset = (first.getDay() + 6) % 7;
-  const start = new Date(y, m - 1, 1 - offset);
-  const monthName = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' }).format(first);
+  const start = new Date(safeYear, safeMonth - 1, 1 - offset);
+  const monthNames = Array.from({ length: 12 }, (_, index) => new Intl.DateTimeFormat(undefined, { month: 'long' }).format(new Date(2020, index, 1)));
+  const monthOptions = monthNames.map((name, index) => `<option value="${index + 1}" ${index + 1 === safeMonth ? 'selected' : ''}>${escapeHtml(name)}</option>`).join('');
+  const yearOptions = Array.from({ length: 201 }, (_, index) => 1900 + index)
+    .map((year) => `<option value="${year}" ${year === safeYear ? 'selected' : ''}>${year}</option>`).join('');
   const days = [];
   for (let i = 0; i < 42; i++) {
     const day = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
     const dayKey = localDateInput(day);
     days.push(`<button type="button" class="date-picker-day ${day.getMonth() !== first.getMonth() ? 'outside' : ''} ${dayKey === key ? 'selected' : ''} ${dayKey === localDateInput() ? 'today' : ''}" data-date-choice="${dayKey}">${day.getDate()}</button>`);
   }
-  popover.dataset.month = `${y}-${String(m).padStart(2, '0')}`;
-  popover.innerHTML = `<div class="date-picker-head"><button type="button" data-date-month="-1" aria-label="Previous month">‹</button><strong>${escapeHtml(monthName)}</strong><button type="button" data-date-month="1" aria-label="Next month">›</button></div><div class="date-picker-weekdays"><span>Mo</span><span>Tu</span><span>We</span><span>Th</span><span>Fr</span><span>Sa</span><span>Su</span></div><div class="date-picker-days">${days.join('')}</div>`;
+  popover.dataset.month = `${safeYear}-${String(safeMonth).padStart(2, '0')}`;
+  popover.innerHTML = `<div class="date-picker-head"><button type="button" class="date-picker-nav" data-date-nav="-1" aria-label="Previous month" title="Previous month">‹</button><div class="date-picker-head-selects"><select class="date-picker-month-select" data-date-month-select aria-label="Choose month">${monthOptions}</select><select class="date-picker-year-select" data-date-year-select aria-label="Choose year">${yearOptions}</select></div><button type="button" class="date-picker-nav" data-date-nav="1" aria-label="Next month" title="Next month">›</button></div><div class="date-picker-weekdays"><span>Mo</span><span>Tu</span><span>We</span><span>Th</span><span>Fr</span><span>Sa</span><span>Su</span></div><div class="date-picker-days">${days.join('')}</div>`;
+
+  // Bind controls directly after each render. This avoids stale/delegated handlers
+  // when the popup is rebuilt and keeps month navigation reliable on touch devices.
+  const changeMonth = (delta) => {
+    const next = new Date(safeYear, safeMonth - 1 + delta, 1);
+    popover.dataset.month = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}`;
+    renderDatePopover(input, popover);
+  };
+  popover.querySelectorAll('[data-date-nav]').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      changeMonth(Number(button.dataset.dateNav));
+    });
+  });
+  const monthSelect = popover.querySelector('[data-date-month-select]');
+  const yearSelect = popover.querySelector('[data-date-year-select]');
+  const applySelectedMonthYear = () => {
+    const nextYear = Number(yearSelect.value);
+    const nextMonth = Number(monthSelect.value);
+    if (!Number.isInteger(nextYear) || !Number.isInteger(nextMonth)) return;
+    popover.dataset.month = `${nextYear}-${String(nextMonth).padStart(2, '0')}`;
+    renderDatePopover(input, popover);
+  };
+  monthSelect.addEventListener('change', applySelectedMonthYear);
+  yearSelect.addEventListener('change', applySelectedMonthYear);
+  popover.querySelectorAll('[data-date-choice]').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      input.value = formatDateText(button.dataset.dateChoice);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      popover.hidden = true;
+    });
+  });
 }
 function setupDateInputs() {
   $$('input[data-date-field]').forEach((input) => {
@@ -980,24 +1021,6 @@ function setupDateInputs() {
     input.addEventListener('blur', () => {
       const parsed = parseDateText(input.value);
       if (parsed) input.value = formatDateText(parsed);
-    });
-    popover.addEventListener('mousedown', (event) => event.preventDefault());
-    popover.addEventListener('click', (event) => {
-      const monthButton = event.target.closest('[data-date-month]');
-      if (monthButton) {
-        const [year, month] = popover.dataset.month.split('-').map(Number);
-        const next = new Date(year, month - 1 + Number(monthButton.dataset.dateMonth), 1);
-        popover.dataset.month = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}`;
-        renderDatePopover(input, popover);
-        return;
-      }
-      const dayButton = event.target.closest('[data-date-choice]');
-      if (dayButton) {
-        input.value = formatDateText(dayButton.dataset.dateChoice);
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-        popover.hidden = true;
-      }
     });
   });
   document.addEventListener('click', (event) => {
