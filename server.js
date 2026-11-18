@@ -145,6 +145,7 @@ ensureColumn('routines', 'progressive', 'INTEGER NOT NULL DEFAULT 1');
 ensureColumn('routines', 'linked_to_routine_id', 'TEXT');
 ensureColumn('routines', 'linked_offset_days', 'INTEGER NOT NULL DEFAULT -1');
 ensureColumn('routines', 'linked_completed_anchor', 'TEXT');
+ensureColumn('google_events', 'description', 'TEXT');
 ensureColumn('google_tasks', 'completion_id', 'TEXT');
 ensureColumn('routines', 'icon_name', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('routines', 'icon_color', "TEXT NOT NULL DEFAULT ''");
@@ -793,14 +794,14 @@ async function syncCalendarForAccount(accountKey, attempt = 0) {
         const start = event.start && (event.start.dateTime || event.start.date);
         if (!start) continue;
         const end = event.end && (event.end.dateTime || event.end.date);
-        db.prepare(`INSERT INTO google_events(account_key,event_id,summary,start_at,end_at,all_day,status,location,html_link,updated_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?)
+        db.prepare(`INSERT INTO google_events(account_key,event_id,summary,start_at,end_at,all_day,status,location,html_link,description,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?)
           ON CONFLICT(account_key,event_id) DO UPDATE SET
             summary=excluded.summary,start_at=excluded.start_at,end_at=excluded.end_at,all_day=excluded.all_day,
-            status=excluded.status,location=excluded.location,html_link=excluded.html_link,updated_at=excluded.updated_at`)
+            status=excluded.status,location=excluded.location,html_link=excluded.html_link,description=excluded.description,updated_at=excluded.updated_at`)
           .run(accountKey, event.id, event.summary || '(No title)', start, end || null,
             event.start.date ? 1 : 0, event.status || 'confirmed', event.location || null,
-            event.htmlLink || null, event.updated || null);
+            event.htmlLink || null, event.description || null, event.updated || null);
       }
       pageToken = response.data.nextPageToken || null;
       nextSyncToken = response.data.nextSyncToken || nextSyncToken;
@@ -1237,11 +1238,11 @@ app.get('/api/calendar', async (req, res) => {
     }
     const events = [];
     if (account) {
-      const googleRows = db.prepare(`SELECT event_id,summary,start_at,end_at,all_day,location,html_link
+      const googleRows = db.prepare(`SELECT event_id,summary,start_at,end_at,all_day,location,html_link,description
         FROM google_events WHERE account_key=? AND start_at < ? AND COALESCE(end_at,start_at) >= ?`)
         .all(account.account_key, end.toISOString().slice(0, 10) + 'T23:59:59.999Z', start.toISOString().slice(0, 10));
       for (const row of googleRows) events.push({ id: `g_${row.event_id}`, title: row.summary, start: row.start_at, end: row.end_at,
-        allDay: Boolean(row.all_day), kind: 'google', location: row.location, url: row.html_link });
+        allDay: Boolean(row.all_day), kind: 'google', location: row.location, description: row.description, url: row.html_link });
     }
     const routines = listRoutines(req.userId);
     for (const r of routines) {
@@ -1251,14 +1252,14 @@ app.get('/api/calendar', async (req, res) => {
       }
       if (r.type === 'frequency' && r.checkinAvailable && !r.maximumReached) {
         const opportunity = new Date(r.nextOpportunityAt || r.periodStart);
-        if (opportunity >= start && opportunity < end) events.push({ id: `freq_${r.id}`, title: `${r.title} · check-in`, start: opportunity.toISOString(), allDay: true, kind: 'frequency', routineId: r.id, color: r.color, available: r.checkinAvailable });
+        if (opportunity >= start && opportunity < end) events.push({ id: `freq_${r.id}`, title: `${r.title} · task`, start: opportunity.toISOString(), allDay: true, kind: 'frequency', routineId: r.id, color: r.color, available: r.checkinAvailable });
       }
     }
-    const completionRows = db.prepare(`SELECT c.id,c.completed_at,r.title,r.color,r.id AS routine_id
+    const completionRows = db.prepare(`SELECT c.id,c.completed_at,c.note,r.title,r.color,r.id AS routine_id
       FROM completions c JOIN routines r ON r.id=c.routine_id
       WHERE c.user_id=? AND c.completed_at>=? AND c.completed_at<? ORDER BY c.completed_at`)
       .all(req.userId, start.toISOString(), end.toISOString());
-    for (const row of completionRows) events.push({ id: `done_${row.id}`, title: `${row.title} · completed`, start: row.completed_at, allDay: false, kind: 'completion', routineId: row.routine_id, completionId: row.id, color: row.color });
+    for (const row of completionRows) events.push({ id: `done_${row.id}`, title: `${row.title} · completed`, start: row.completed_at, allDay: false, kind: 'completion', routineId: row.routine_id, completionId: row.id, color: row.color, note: row.note });
     res.json({ month, events, googleLastSync: account?.last_calendar_sync || null, syncWarning });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
@@ -1306,7 +1307,7 @@ const server = app.listen(PORT, () => {
 });
 
 // Unlock and publish Google Tasks from the server even when the dashboard is closed.
-// This keeps progressive frequency check-ins and repeat-after dates in sync automatically.
+// This keeps progressive frequency tasks and repeat-after dates in sync automatically.
 async function runBackgroundTaskSync() {
   const users = db.prepare('SELECT id FROM users WHERE google_account_key IS NOT NULL').all();
   for (const user of users) {

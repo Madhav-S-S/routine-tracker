@@ -556,3 +556,49 @@ body { background: radial-gradient(ellipse at 12% 0%, rgba(116,80,185,.12), tran
     margin-left: auto;
   }
 }
+
+
+/* Expandable calendar day details: every item is listed, never clipped by the month cell. */
+.calendar-day { cursor: pointer; transition: background .16s ease, box-shadow .16s ease; }
+.calendar-day:hover { background: rgba(154, 136, 219, .075); }
+.calendar-day:focus-visible { outline: 2px solid #a895f0; outline-offset: -2px; z-index: 1; }
+.calendar-day.selected { background: rgba(154, 136, 219, .14); box-shadow: inset 0 0 0 1px rgba(176, 155, 255, .58); }
+.calendar-day-hint { margin: 5px 0 0 4px; color: #857d9d; font-size: 8px; }
+.calendar-more { color: #c1b5ee; font-size: 8px; font-weight: 700; }
+.calendar-day-panel { margin-top: 14px; padding: 20px; border: 1px solid #453d5b; border-radius: 18px; background: linear-gradient(145deg, #242134, #1d1b29); box-shadow: 0 12px 34px rgba(0,0,0,.18); }
+.calendar-day-panel[hidden] { display: none !important; }
+.calendar-day-panel-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 16px; }
+.calendar-day-panel-header h3 { margin: 5px 0 4px; color: #f0ecf8; font: 700 19px/1.25 'Manrope', sans-serif; letter-spacing: -.45px; }
+.calendar-day-panel-header p { margin: 0; color: #a39db5; font-size: 11px; }
+.calendar-day-panel-close { flex: 0 0 auto; font-size: 19px; }
+.calendar-day-items { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.calendar-day-item { min-width: 0; border: 1px solid #3b354d; border-radius: 13px; background: #1a1825; overflow: hidden; }
+.calendar-day-item-main { display: grid; width: 100%; grid-template-columns: 8px minmax(0,1fr) auto; align-items: start; gap: 12px; padding: 14px; border: 0; background: transparent; text-align: left; cursor: pointer; color: inherit; }
+.calendar-day-item-main:hover { background: rgba(168, 149, 240, .08); }
+.calendar-day-item-marker { width: 7px; height: 7px; margin-top: 5px; border-radius: 50%; background: var(--day-item-accent, #a895f0); box-shadow: 0 0 0 4px color-mix(in srgb, var(--day-item-accent, #a895f0) 17%, transparent); }
+.calendar-day-item-copy { min-width: 0; display: flex; flex-direction: column; gap: 7px; }
+.calendar-day-item-heading { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.calendar-day-item-heading strong { color: #eeeaf7; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.calendar-day-item-heading small { color: #a895f0; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .65px; }
+.calendar-day-item-detail { color: #aaa4bb; font-size: 10px; line-height: 1.55; overflow-wrap: anywhere; }
+.calendar-day-item-time { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; color: #d3cdea; font-size: 10px; white-space: nowrap; }
+.calendar-day-item-time span { color: #9789c9; font-size: 9px; font-weight: 700; }
+.calendar-day-open-link { display: inline-flex; margin: 0 14px 12px 34px; color: #adc3f0; font-size: 10px; text-decoration: none; }
+.calendar-day-open-link:hover { text-decoration: underline; }
+.calendar-day-empty { min-height: 115px; grid-column: 1/-1; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 6px; border: 1px dashed #49425b; border-radius: 13px; color: #aaa4bb; }
+.calendar-day-empty > span { color: #b6a5f5; font-size: 22px; }
+.calendar-day-empty strong { color: #e8e2f2; font-size: 12px; }
+.calendar-day-empty small { color: #928ba5; font-size: 10px; }
+/* Checklist actions use a compact tick icon instead of a textual "check in" action. */
+.check-action { width: 34px; height: 34px; flex: 0 0 34px; display: inline-grid; place-items: center; padding: 0; border-radius: 11px; font-size: 19px; line-height: 1; }
+.check-action:hover { transform: translateY(-1px); }
+.check-action span { line-height: 1; }
+@media (max-width: 760px) {
+  .calendar-day-items { grid-template-columns: 1fr; }
+  .calendar-day-panel { padding: 15px; }
+  .calendar-day-item-main { grid-template-columns: 8px minmax(0,1fr); }
+  .calendar-day-item-time { grid-column: 2; align-items: flex-start; flex-direction: row; gap: 12px; }
+}
+
+.calendar-day .day-select { border: 0; background: transparent; padding: 0; font: inherit; cursor: pointer; }
+.calendar-day .day-select:focus-visible { outline: 2px solid #b9a8ff; outline-offset: 2px; }

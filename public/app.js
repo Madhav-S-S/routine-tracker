@@ -16,6 +16,7 @@ const state = {
   calendarMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
   calendarEvents: [],
   calendarWarning: null,
+  selectedCalendarDate: null,
   selectedCalendarEvent: null
 };
 
@@ -315,7 +316,7 @@ function renderStats() {
 function routineStatusText(routine) {
   if (routine.type === 'frequency') {
     if (routine.maximumReached) return 'Target complete';
-    if (!routine.checkinAvailable) return `Next check-in unlocks ${formatDate(routine.nextUnlockAt || routine.nextOpportunityAt || routine.periodStart, { day: 'numeric', month: 'short' })}`;
+    if (!routine.checkinAvailable) return `Next task appears ${formatDate(routine.nextUnlockAt || routine.nextOpportunityAt || routine.periodStart, { day: 'numeric', month: 'short' })}`;
     if (routine.minimumReached) return 'Minimum reached';
     return `${routine.remainingMinimum} more to reach minimum`;
   }
@@ -331,7 +332,7 @@ function routineCard(routine) {
   const canComplete = isFrequency ? !routine.maximumReached : Boolean(routine.isDue);
   const statusGood = isFrequency ? routine.minimumReached : !routine.isDue;
   const status = routineStatusText(routine);
-  const actionLabel = completed ? 'All done' : isFrequency ? (routine.checkinAvailable ? 'Log a check-in' : 'Log early') : (routine.isDue ? 'Mark complete' : 'Not due yet');
+  const actionLabel = completed ? 'All done' : isFrequency ? (routine.checkinAvailable ? 'Tick' : 'Tick early') : (routine.isDue ? 'Tick' : 'Not due yet');
   return `
     <article class="routine-card custom-routine-color" style="--routine-accent:${accent};--routine-icon-color:${iconTint}" data-routine-card="${escapeHtml(routine.id)}">
       <div class="routine-top">
@@ -358,10 +359,9 @@ function renderChecklist() {
     const info = isFrequency
       ? `${r.completedCount}/${r.max_count} completed this period${r.minimumReached ? ' · minimum reached' : ` · ${r.remainingMinimum} more for minimum`}`
       : `${dueDescription(r)} · ${r.cadenceLabel}`;
-    const label = isFrequency ? 'Check in' : 'Mark done';
     const accent = resolveColor(r.color);
     const iconTint = accent;
-    return `<article class="checklist-card" style="--routine-accent:${accent};--routine-icon-color:${iconTint}"><div class="check-spot">${renderRoutineIcon(r.icon_name || suggestIconName(r.title), iconTint, 18)}</div><div class="check-info"><strong>${escapeHtml(r.title)}</strong><small>${escapeHtml(info)}</small></div><button class="check-action" data-action="complete" data-id="${escapeHtml(r.id)}">${label} <span>→</span></button></article>`;
+    return `<article class="checklist-card" style="--routine-accent:${accent};--routine-icon-color:${iconTint}"><div class="check-spot">${renderRoutineIcon(r.icon_name || suggestIconName(r.title), iconTint, 18)}</div><div class="check-info"><strong>${escapeHtml(r.title)}</strong><small>${escapeHtml(info)}</small></div><button class="check-action" data-action="complete" data-id="${escapeHtml(r.id)}" aria-label="Mark ${escapeHtml(r.title)} complete" title="Mark complete"><span aria-hidden="true">✓</span></button></article>`;
   }).join('');
 }
 
@@ -432,6 +432,7 @@ async function loadCalendar() {
     const data = await api(`/api/calendar?month=${encodeURIComponent(month)}`);
     state.calendarEvents = data.events || [];
     state.calendarWarning = data.syncWarning;
+    if (state.selectedCalendarDate && !state.selectedCalendarDate.startsWith(month)) state.selectedCalendarDate = null;
     renderCalendarGrid();
     $('#calendarFootnote').textContent = data.syncWarning
       ? `Calendar sync needs attention: ${data.syncWarning}`
@@ -441,6 +442,67 @@ async function loadCalendar() {
   } catch (error) {
     $('#calendarGrid').innerHTML = `<div class="calendar-empty">${escapeHtml(error.message)}</div>`;
   }
+}
+function calendarEventsForDate(key) {
+  return state.calendarEvents
+    .filter((event) => dateKey(event.start) === key)
+    .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+}
+function calendarKindLabel(event) {
+  return ({ google: 'Google event', completion: 'Completed', due: 'Routine due', frequency: 'Frequency task' })[event.kind] || 'Calendar item';
+}
+function calendarTimeLabel(event) {
+  if (event.allDay) return 'All day';
+  const start = formatDate(event.start, { hour: 'numeric', minute: '2-digit' });
+  const end = event.end ? formatDate(event.end, { hour: 'numeric', minute: '2-digit' }) : '';
+  return end && end !== 'Not set' ? `${start} – ${end}` : start;
+}
+function calendarEventDetailText(event) {
+  if (event.kind === 'google') {
+    return [event.description, event.location ? `Location: ${event.location}` : ''].filter(Boolean).join(' · ') || 'Google Calendar event';
+  }
+  if (event.kind === 'completion') return event.note || 'Routine marked complete';
+  const routine = state.routines.find((item) => item.id === event.routineId);
+  const details = [];
+  if (routine?.notes) details.push(routine.notes);
+  if (routine?.cadenceLabel) details.push(routine.cadenceLabel);
+  if (event.linked || routine?.linked_to_routine_id) details.push('Linked task · date follows its parent routine');
+  if (event.kind === 'frequency' && routine) details.push(`${routine.completedCount || 0} of ${routine.max_count} completed this period`);
+  return details.join(' · ') || (event.kind === 'frequency' ? 'Frequency routine task' : routine?.title ? 'Repeat-after routine task' : 'Routine task');
+}
+function renderCalendarDayDetails() {
+  const panel = $('#calendarDayPanel');
+  const key = state.selectedCalendarDate;
+  if (!panel || !key) { if (panel) panel.hidden = true; return; }
+  const date = new Date(`${key}T12:00:00`);
+  const events = calendarEventsForDate(key);
+  $('#calendarSelectedDateTitle').textContent = formatLongDate(date);
+  $('#calendarSelectedDateSubtitle').textContent = `${events.length} ${events.length === 1 ? 'task or event' : 'tasks and events'} on this date`;
+  if (!events.length) {
+    $('#calendarDayItems').innerHTML = '<div class="calendar-day-empty"><span>✧</span><strong>No tasks or events</strong><small>Nothing is scheduled for this date.</small></div>';
+  } else {
+    $('#calendarDayItems').innerHTML = events.map((event) => {
+      const routine = state.routines.find((item) => item.id === event.routineId);
+      const accent = event.color || routine?.color || '#9a88db';
+      const detail = calendarEventDetailText(event);
+      const googleLink = event.kind === 'google' && event.url
+        ? `<a class="calendar-day-open-link" href="${escapeHtml(event.url)}" target="_blank" rel="noopener">Open in Google ↗</a>` : '';
+      return `<article class="calendar-day-item" style="--day-item-accent:${escapeHtml(accent)}"><button type="button" class="calendar-day-item-main" data-calendar-event="${escapeHtml(event.id)}" aria-label="View details for ${escapeHtml(event.title)}"><span class="calendar-day-item-marker" aria-hidden="true"></span><span class="calendar-day-item-copy"><span class="calendar-day-item-heading"><strong>${escapeHtml(event.title)}</strong><small>${escapeHtml(calendarKindLabel(event))}</small></span><span class="calendar-day-item-detail">${escapeHtml(detail)}</span></span><span class="calendar-day-item-time">${escapeHtml(calendarTimeLabel(event))}<span>Details ↗</span></span></button>${googleLink}</article>`;
+    }).join('');
+  }
+  panel.hidden = false;
+}
+function selectCalendarDate(key) {
+  const [year, month] = key.split('-').map(Number);
+  if (year !== state.calendarMonth.getFullYear() || month !== state.calendarMonth.getMonth() + 1) {
+    state.calendarMonth = new Date(year, month - 1, 1);
+    state.selectedCalendarDate = key;
+    loadCalendar();
+    return;
+  }
+  state.selectedCalendarDate = state.selectedCalendarDate === key ? null : key;
+  renderCalendarGrid();
+  if (state.selectedCalendarDate) $('#calendarDayPanel')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 function renderCalendarGrid() {
   const first = new Date(state.calendarMonth.getFullYear(), state.calendarMonth.getMonth(), 1);
@@ -458,13 +520,14 @@ function renderCalendarGrid() {
   for (let i = 0; i < 42; i++) {
     const day = new Date(gridStart.getFullYear(), gridStart.getMonth(), gridStart.getDate() + i);
     const key = localDateInput(day);
-    const events = grouped.get(key) || [];
-    const visible = events.slice(0, 3);
+    const events = (grouped.get(key) || []).sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+    const visible = events.slice(0, 2);
     const more = events.length - visible.length;
     const eventMarkup = visible.map((event) => `<button type="button" class="calendar-event ${escapeHtml(event.kind)}" data-calendar-event="${escapeHtml(event.id)}" title="Open ${escapeHtml(event.title)}">${escapeHtml(event.title)}</button>`).join('');
-    cells.push(`<div class="calendar-day ${day.getMonth() !== state.calendarMonth.getMonth() ? 'outside' : ''} ${key === todayKey ? 'today' : ''}"><span class="day-number">${day.getDate()}</span>${eventMarkup}${more > 0 ? `<div class="calendar-more">+${more} more</div>` : ''}</div>`);
+    cells.push(`<div data-calendar-date="${key}" class="calendar-day ${day.getMonth() !== state.calendarMonth.getMonth() ? 'outside' : ''} ${key === todayKey ? 'today' : ''} ${state.selectedCalendarDate === key ? 'selected' : ''}"><button type="button" class="day-number day-select" data-calendar-date="${key}" aria-label="Show ${events.length} tasks and events for ${escapeHtml(formatLongDate(day))}" aria-pressed="${state.selectedCalendarDate === key}">${day.getDate()}</button>${eventMarkup}${more > 0 ? `<div class="calendar-more">+${more} more · select date</div>` : events.length ? '<div class="calendar-day-hint">Select date for details</div>' : ''}</div>`);
   }
   $('#calendarGrid').innerHTML = cells.join('');
+  renderCalendarDayDetails();
 }
 
 async function loadHistory() {
@@ -473,7 +536,7 @@ async function loadHistory() {
     const data = await api('/api/history?limit=100');
     const rows = data.history || [];
     if (!rows.length) {
-      $('#historyList').innerHTML = '<div class="history-empty">Your completed routines will appear here. Your first check-in is a good place to start.</div>';
+      $('#historyList').innerHTML = '<div class="history-empty">Your completed routines will appear here. Tick off a routine to get started.</div>';
       return;
     }
     $('#historyList').innerHTML = rows.map((row) => `<div class="history-entry"><div class="history-mark">✓</div><div class="history-entry-copy"><strong>${escapeHtml(row.title)}</strong><small>${escapeHtml(row.note || 'Routine completed')}</small></div><div class="history-date">${formatDate(row.completed_at, { day: 'numeric', month: 'short' })} · ${formatDate(row.completed_at, { hour: 'numeric', minute: '2-digit' })}</div><button class="history-delete" type="button" data-action="delete-activity" data-id="${escapeHtml(row.id)}" aria-label="Delete activity" title="Delete activity">×</button></div>`).join('');
@@ -614,12 +677,12 @@ async function saveRoutine(event) {
 async function completeRoutine(id) {
   const routine = state.routines.find((r) => r.id === id);
   if (!routine) return;
-  setSyncState('syncing', 'Saving your check-in');
+  setSyncState('syncing', 'Saving completion');
   try {
     await api(`/api/routines/${encodeURIComponent(id)}/complete`, { method: 'POST', body: JSON.stringify({}) });
     await loadBootstrap();
     if (state.activePage === 'calendar') await loadCalendar();
-    toast(`${routine.title} checked off. Nice work.`);
+    toast(`${routine.title} completed. Nice work.`);
   } catch (error) { toast(error.message, 'error'); setSyncState('error', 'Save failed'); }
 }
 async function archiveRoutine(id) {
@@ -628,7 +691,7 @@ async function archiveRoutine(id) {
   try {
     await api(`/api/routines/${encodeURIComponent(id)}`, { method: 'DELETE' });
     await loadBootstrap();
-    toast('Routine archived. Its check-in history is preserved.');
+    toast('Routine archived. Its completion history is preserved.');
   } catch (error) { toast(error.message, 'error'); }
 }
 
@@ -638,7 +701,7 @@ function openCalendarEvent(event) {
   const isCompletion = event.kind === 'completion';
   const isGoogle = event.kind === 'google';
   const isDue = event.kind === 'due' || event.kind === 'frequency';
-  $('#calendarEventDescription').textContent = isGoogle ? (event.location || 'Google Calendar event') : isCompletion ? 'Edit the date of this completed activity or remove it from your history.' : event.kind === 'frequency' ? (event.available ? 'Your Progressive check-in is unlocked. Complete it when you are ready.' : 'This Progressive check-in appears here in advance and unlocks at its scheduled point in the period.') : event.linked ? 'This task follows another routine. Its date moves automatically when the linked routine is rescheduled.' : 'Complete this task when it is due, or change its scheduled date.';
+  $('#calendarEventDescription').textContent = isGoogle ? ([event.description, event.location ? `Location: ${event.location}` : ''].filter(Boolean).join(' · ') || 'Google Calendar event') : isCompletion ? 'Edit the date of this completed activity or remove it from your history.' : event.kind === 'frequency' ? (event.available ? 'This Progressive task is available. Complete it when ready.' : 'This task appears when its scheduled point in the period is reached.') : event.linked ? 'This task follows another routine. Its date moves automatically when the linked routine is rescheduled.' : 'Complete this task when it is due, or change its scheduled date.';
   const canEditDate = isCompletion || (event.kind === 'due' && !event.linked);
   $('#calendarActionDateLabel').textContent = isCompletion ? 'Completion date' : 'Scheduled date';
   $('#calendarActionDateLabel').hidden = !canEditDate;
@@ -647,7 +710,7 @@ function openCalendarEvent(event) {
   dateWrap.hidden = !canEditDate;
   $('#calendarEventComplete').hidden = !isDue;
   $('#calendarEventComplete').disabled = (isDue && event.available === false) || isGoogle;
-  $('#calendarEventComplete').textContent = event.kind === 'frequency' ? 'Check in now' : 'Mark complete';
+  $('#calendarEventComplete').textContent = event.kind === 'frequency' ? 'Tick now' : 'Mark complete';
   $('#calendarEventSaveDate').hidden = !canEditDate;
   $('#calendarEventDelete').hidden = !isCompletion;
   $('#calendarEventOpen').hidden = !isGoogle || !event.url;
@@ -851,8 +914,8 @@ function installHandlers() {
   });
   $('#hasLastDone').addEventListener('change', toggleLastDoneFields);
   $('#linkedEnabled').addEventListener('change', toggleLinkedFields);
-  $('#calendarPrev').addEventListener('click', () => { state.calendarMonth.setMonth(state.calendarMonth.getMonth() - 1); loadCalendar(); });
-  $('#calendarNext').addEventListener('click', () => { state.calendarMonth.setMonth(state.calendarMonth.getMonth() + 1); loadCalendar(); });
+  $('#calendarPrev').addEventListener('click', () => { state.calendarMonth = new Date(state.calendarMonth.getFullYear(), state.calendarMonth.getMonth() - 1, 1); state.selectedCalendarDate = null; loadCalendar(); });
+  $('#calendarNext').addEventListener('click', () => { state.calendarMonth = new Date(state.calendarMonth.getFullYear(), state.calendarMonth.getMonth() + 1, 1); state.selectedCalendarDate = null; loadCalendar(); });
   $('#routineFilters').addEventListener('click', (event) => {
     const button = event.target.closest('[data-filter]');
     if (!button) return;
@@ -881,7 +944,20 @@ function installHandlers() {
   $('#mobileMenuButton')?.addEventListener('click', () => { const open = $('#sidebar').classList.toggle('open'); $('#mobileMenuButton').setAttribute('aria-expanded', String(open)); });
   $('#mobileProfileButton')?.addEventListener('click', () => setPage('settings'));
   $('#sidebarProfile')?.addEventListener('click', () => setPage('settings'));
-  $('#calendarGrid').addEventListener('click', (event) => { const target = event.target.closest('[data-calendar-event]'); if (!target) return; const item = state.calendarEvents.find((row) => row.id === target.dataset.calendarEvent); if (item) openCalendarEvent(item); });
+  const handleCalendarSelection = (event) => {
+    const eventButton = event.target.closest('[data-calendar-event]');
+    if (eventButton) {
+      event.stopPropagation();
+      const item = state.calendarEvents.find((row) => row.id === eventButton.dataset.calendarEvent);
+      if (item) openCalendarEvent(item);
+      return;
+    }
+    const day = event.target.closest('[data-calendar-date]');
+    if (day) selectCalendarDate(day.dataset.calendarDate);
+  };
+  $('#calendarGrid').addEventListener('click', handleCalendarSelection);
+  $('#calendarDayItems').addEventListener('click', handleCalendarSelection);
+  $('#closeCalendarDayPanel').addEventListener('click', () => { state.selectedCalendarDate = null; renderCalendarGrid(); });
   $('#closeCalendarEventModal').addEventListener('click', closeCalendarEvent);
   $('#calendarEventModal').addEventListener('click', (event) => { if (event.target === $('#calendarEventModal')) closeCalendarEvent(); });
   $('#calendarEventComplete').addEventListener('click', completeCalendarEvent);
