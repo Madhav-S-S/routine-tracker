@@ -6,6 +6,8 @@
   <meta name="theme-color" content="#14131c">
   <meta name="description" content="A calm, thoughtful space to keep your routines moving.">
   <title>Routine — Make room for what matters</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="apple-touch-icon" href="/favicon.svg">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -35,8 +37,13 @@
     <main class="main-content">
       <header class="topbar">
         <button class="icon-button mobile-menu" id="mobileMenuButton" aria-label="Open navigation menu" aria-controls="sidebar" aria-expanded="false">☰</button>
+        <button class="mobile-header-profile" id="mobileProfileButton" type="button" aria-label="Open profile and account settings">
+          <span class="top-avatar" id="mobileHeaderAvatar">Y</span>
+          <span class="mobile-header-user"><strong id="mobileHeaderName">Your space</strong><small id="mobileHeaderEmail">Local workspace</small></span>
+        </button>
         <div class="breadcrumb"><strong id="breadcrumbCurrent">Overview</strong></div>
         <div class="topbar-actions">
+          <button class="icon-button mobile-header-settings" id="mobileSettingsButton" type="button" aria-label="Open settings">⚙</button>
           <div class="sync-indicator" id="syncIndicator"><span class="sync-dot"></span><span id="syncText">Saved on this server</span></div>
         </div>
       </header>
@@ -161,6 +168,14 @@
       </form>
     </div>
   </div>
+
+  <nav class="mobile-bottom-nav" aria-label="Mobile navigation">
+    <button class="mobile-nav-item active" data-page="dashboard"><span>◫</span><small>Home</small></button>
+    <button class="mobile-nav-item" data-page="calendar"><span>▦</span><small>Calendar</small></button>
+    <button class="mobile-nav-item" data-page="routines"><span>◉</span><small>Routines</small></button>
+    <button class="mobile-nav-item" data-page="history"><span>↗</span><small>Activity</small></button>
+    <button class="mobile-nav-item" data-page="settings"><span>⚙</span><small>Settings</small></button>
+  </nav>
 
   <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
   <script src="/app.js" defer></script>
