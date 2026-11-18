@@ -12,6 +12,7 @@ const state = {
   selectedColor: 'lavender',
   selectedIconName: 'sparkles',
   selectedIconColor: '#a895f0',
+  selectedIconBackground: null,
   iconManuallySelected: false,
   calendarMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
   calendarEvents: [],
@@ -24,6 +25,7 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const COLOR_HEX = { lavender: '#a895f0', mint: '#72c6a0', peach: '#e9a77f', blue: '#84a8df', rose: '#d98eaa', gold: '#d8b85d' };
 const COLOR_STORAGE_KEY = 'routine-tracker.saved-colors.v1';
+const ICON_BACKGROUND_STORAGE_KEY = 'routine-tracker.icon-backgrounds.v1';
 const ICON_LIBRARY = [
   ['sparkles','Sparkles','default shine star motivation',`<path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3Z"/><path d="m19 14 .9 2.1L22 17l-2.1.9L19 20l-.9-2.1L16 17l2.1-.9L19 14Z"/>`],
   ['leaf','Leaf','aloe vera rosemary plant herb skin hair nature',`<path d="M20.5 3.5C12 3.5 5 6.2 5 13a7 7 0 0 0 7 7c6.8 0 8.5-8 8.5-16.5Z"/><path d="M3.5 21c3-5 7-8 13-12"/>`],
@@ -113,6 +115,72 @@ function resolveColor(value) {
   if (/^#[0-9a-f]{3}$/i.test(text)) return `#${text[1]}${text[1]}${text[2]}${text[2]}${text[3]}${text[3]}`;
   return COLOR_HEX.lavender;
 }
+function hexRgb(hex) {
+  const value = resolveColor(hex).slice(1);
+  return [0, 2, 4].map((index) => parseInt(value.slice(index, index + 2), 16));
+}
+function rgbHex(rgb) {
+  return `#${rgb.map((value) => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, '0')).join('')}`;
+}
+function mixHex(first, second, amount) {
+  const a = hexRgb(first), b = hexRgb(second);
+  return rgbHex(a.map((value, index) => value * amount + b[index] * (1 - amount)));
+}
+function relativeLuminance(hex) {
+  const channels = hexRgb(hex).map((value) => value / 255).map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+  return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+}
+function contrastRatio(first, second) {
+  const values = [relativeLuminance(first), relativeLuminance(second)].sort((a, b) => b - a);
+  return (values[0] + 0.05) / (values[1] + 0.05);
+}
+function automaticIconBackground(iconColor) {
+  const accent = resolveColor(iconColor);
+  const darkSurface = '#17231b';
+  const lightSurface = '#f5f7ed';
+  const useDark = contrastRatio(accent, darkSurface) >= contrastRatio(accent, lightSurface);
+  const surface = useDark ? darkSurface : lightSurface;
+  // Tint the surface with the icon hue, but retain at least 3:1 contrast for the line icon.
+  for (const amount of [0.24, 0.18, 0.12, 0.08, 0.04, 0.02, 0]) {
+    const candidate = mixHex(accent, surface, amount);
+    if (contrastRatio(accent, candidate) >= 3) return candidate;
+  }
+  return surface;
+}
+function readRoutineIconBackgrounds() {
+  try {
+    const value = JSON.parse(localStorage.getItem(ICON_BACKGROUND_STORAGE_KEY) || '{}');
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value).filter(([id, color]) => typeof id === 'string' && /^#[0-9a-f]{6}$/i.test(String(color))));
+  } catch { return {}; }
+}
+function routineIconBackgroundOverride(routineId) {
+  if (!routineId) return null;
+  return readRoutineIconBackgrounds()[routineId] || null;
+}
+function persistRoutineIconBackground(routineId, color) {
+  if (!routineId) return;
+  const backgrounds = readRoutineIconBackgrounds();
+  if (color && /^#[0-9a-f]{6}$/i.test(color)) backgrounds[routineId] = color.toLowerCase();
+  else delete backgrounds[routineId];
+  try { localStorage.setItem(ICON_BACKGROUND_STORAGE_KEY, JSON.stringify(backgrounds)); }
+  catch { toast('Could not save the icon background in this browser.', 'error'); }
+}
+function selectedIconBackground() {
+  return state.selectedIconBackground || automaticIconBackground(state.selectedIconColor || state.selectedColor);
+}
+function routineIconBackground(routine) {
+  return routineIconBackgroundOverride(routine.id) || automaticIconBackground(routine.color);
+}
+function setSelectedIconBackground(color) {
+  state.selectedIconBackground = color && /^#[0-9a-f]{6}$/i.test(color) ? color.toLowerCase() : null;
+  const picker = $('#customRoutineBackground');
+  if (picker) picker.value = selectedIconBackground();
+  const swatch = $('#routineBackgroundSwatch');
+  if (swatch) swatch.style.backgroundColor = selectedIconBackground();
+  $('#resetRoutineBackground')?.classList.toggle('active', !state.selectedIconBackground);
+  renderIconSelection();
+}
 function suggestIconName(title) {
   const text = String(title || '');
   for (const [pattern, name] of ICON_SUGGESTIONS) if (pattern.test(text)) return name;
@@ -149,14 +217,23 @@ function renderIconGrid() {
   if (!holder) return;
   const query = ($('#iconSearch')?.value || '').trim().toLowerCase();
   const rows = ICON_LIBRARY.filter((item) => !query || `${item.name} ${item.label} ${item.keywords}`.toLowerCase().includes(query));
-  holder.innerHTML = rows.map((item) => `<button type="button" class="icon-choice ${item.name === state.selectedIconName ? 'selected' : ''}" data-icon-name="${item.name}" title="${item.label}" aria-label="${item.label}">${renderRoutineIcon(item.name, state.selectedIconColor, 20)}<small>${item.label}</small></button>`).join('') || '<div class="icon-empty">No icons match that search.</div>';
+  const iconBg = selectedIconBackground();
+  holder.innerHTML = rows.map((item) => `<button type="button" class="icon-choice ${item.name === state.selectedIconName ? 'selected' : ''}" data-icon-name="${item.name}" style="--picker-icon-background:${iconBg};--picker-icon-color:${resolveColor(state.selectedIconColor)}" title="${item.label}" aria-label="${item.label}">${renderRoutineIcon(item.name, state.selectedIconColor, 20)}<small>${item.label}</small></button>`).join('') || '<div class="icon-empty">No icons match that search.</div>';
 }
 function renderIconSelection() {
   const suggestion = suggestIconName($('#routineTitle')?.value || '');
   const suggested = ICON_BY_NAME[suggestion] || ICON_BY_NAME.sparkles;
   $('#iconSuggestionLabel').textContent = `Suggested: ${suggested.label}`;
   $('#useSuggestedIcon').hidden = state.selectedIconName === suggestion;
-  $('#selectedIconPreview').innerHTML = renderRoutineIcon(state.selectedIconName, state.selectedIconColor, 27);
+  const preview = $('#selectedIconPreview');
+  preview.innerHTML = renderRoutineIcon(state.selectedIconName, state.selectedIconColor, 27);
+  preview.style.backgroundColor = selectedIconBackground();
+  preview.style.borderColor = `color-mix(in srgb, ${resolveColor(state.selectedIconColor)} 50%, transparent)`;
+  const bgPicker = $('#customRoutineBackground');
+  if (bgPicker) bgPicker.value = selectedIconBackground();
+  const bgSwatch = $('#routineBackgroundSwatch');
+  if (bgSwatch) bgSwatch.style.backgroundColor = selectedIconBackground();
+  $('#resetRoutineBackground')?.classList.toggle('active', !state.selectedIconBackground);
   renderIconGrid();
 }
 function selectRoutineIcon(name, manual = true) {
@@ -325,6 +402,7 @@ function routineStatusText(routine) {
 function routineCard(routine) {
   const accent = resolveColor(routine.color);
   const iconTint = accent;
+  const iconBackground = routineIconBackground(routine);
   const isFrequency = routine.type === 'frequency';
   const progress = isFrequency ? (routine.progress || 0) : 0;
   const completed = isFrequency && routine.maximumReached;
@@ -334,7 +412,7 @@ function routineCard(routine) {
   const status = routineStatusText(routine);
   const actionTitle = completed ? 'Target complete' : !canComplete ? 'Not due yet' : isFrequency && !routine.checkinAvailable ? 'Log an early completion' : 'Mark complete';
   return `
-    <article class="routine-card custom-routine-color" style="--routine-accent:${accent};--routine-icon-color:${iconTint}" data-routine-card="${escapeHtml(routine.id)}">
+    <article class="routine-card custom-routine-color" style="--routine-accent:${accent};--routine-icon-color:${iconTint};--routine-icon-background:${iconBackground}" data-routine-card="${escapeHtml(routine.id)}">
       <div class="routine-top">
         <div class="routine-symbol">${renderRoutineIcon(routine.icon_name || suggestIconName(routine.title), iconTint, 19)}</div>
         <div class="routine-title-wrap"><h3 title="${escapeHtml(routine.title)}">${escapeHtml(routine.title)}</h3><p>${escapeHtml(isFrequency ? (routine.linked_to_routine_id ? 'Linked frequency target' : 'Frequency target') : routine.linked_to_routine_id ? 'Linked routine' : 'Repeat after completion')}</p></div>
@@ -361,7 +439,8 @@ function renderChecklist() {
       : `${dueDescription(r)} · ${r.cadenceLabel}`;
     const accent = resolveColor(r.color);
     const iconTint = accent;
-    return `<article class="checklist-card" style="--routine-accent:${accent};--routine-icon-color:${iconTint}"><div class="check-spot">${renderRoutineIcon(r.icon_name || suggestIconName(r.title), iconTint, 18)}</div><div class="check-info"><strong>${escapeHtml(r.title)}</strong><small>${escapeHtml(info)}</small></div><button class="check-action" data-action="complete" data-id="${escapeHtml(r.id)}" aria-label="Mark ${escapeHtml(r.title)} complete" title="Mark complete"><span aria-hidden="true">✓</span></button></article>`;
+    const iconBackground = routineIconBackground(r);
+    return `<article class="checklist-card" style="--routine-accent:${accent};--routine-icon-color:${iconTint};--routine-icon-background:${iconBackground}"><div class="check-spot">${renderRoutineIcon(r.icon_name || suggestIconName(r.title), iconTint, 18)}</div><div class="check-info"><strong>${escapeHtml(r.title)}</strong><small>${escapeHtml(info)}</small></div><button class="check-action" data-action="complete" data-id="${escapeHtml(r.id)}" aria-label="Mark ${escapeHtml(r.title)} complete" title="Mark complete"><span aria-hidden="true">✓</span></button></article>`;
   }).join('');
 }
 
@@ -669,6 +748,7 @@ function openRoutineModal(routine = null) {
   $('#routineTitle').value = routine?.title || '';
   $('#routineNotes').value = routine?.notes || '';
   const type = routine?.type || 'frequency';
+  state.selectedIconBackground = routineIconBackgroundOverride(routine?.id);
   setSelectedType(type);
   setSelectedColor(routine?.color || 'lavender');
   state.selectedIconName = routine?.icon_name && routine.icon_name !== 'sparkles' ? routine.icon_name : suggestIconName(routine?.title || '');
@@ -743,7 +823,9 @@ async function saveRoutine(event) {
   button.textContent = 'Saving…';
   setSyncState('syncing', 'Saving your routine');
   try {
-    await api(id ? `/api/routines/${encodeURIComponent(id)}` : '/api/routines', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(body) });
+    const result = await api(id ? `/api/routines/${encodeURIComponent(id)}` : '/api/routines', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(body) });
+    const savedRoutineId = id || result.routine?.id;
+    if (savedRoutineId) persistRoutineIconBackground(savedRoutineId, state.selectedIconBackground);
     closeRoutineModal();
     await loadBootstrap();
     if (state.activePage === 'calendar') await loadCalendar();
@@ -982,6 +1064,8 @@ function installHandlers() {
   $$('.type-option').forEach((button) => button.addEventListener('click', () => setSelectedType(button.dataset.type)));
   $$('.color-choice').forEach((button) => button.addEventListener('click', () => setSelectedColor(button.dataset.color)));
   $('#customRoutineColor').addEventListener('input', (event) => setSelectedColor(event.target.value));
+  $('#customRoutineBackground').addEventListener('input', (event) => setSelectedIconBackground(event.target.value));
+  $('#resetRoutineBackground').addEventListener('click', () => setSelectedIconBackground(null));
   $('#saveRoutineColor').addEventListener('click', () => saveColorToBrowser(state.selectedColor));
   $('#savedColorOptions').addEventListener('click', (event) => {
     const button = event.target.closest('[data-saved-color]');

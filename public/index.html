@@ -190,7 +190,18 @@
 
         <div class="routine-customization">
           <section class="customization-section">
-            <div class="field-label color-field-label">Routine color</div>
+            <div class="routine-color-heading">
+              <div class="field-label color-field-label">Routine color</div>
+              <div class="icon-bg-tools" aria-label="Icon background options">
+                <span>Icon BG</span>
+                <label class="mini-bg-picker" title="Choose a custom icon background" aria-label="Choose a custom icon background">
+                  <input type="color" id="customRoutineBackground" value="#34422a" aria-label="Choose icon background color">
+                  <i id="routineBackgroundSwatch" aria-hidden="true"></i>
+                  <small>BG</small>
+                </label>
+                <button type="button" class="icon-bg-auto active" id="resetRoutineBackground" title="Use an automatic contrast background">Auto</button>
+              </div>
+            </div>
             <div class="color-options" id="colorOptions">
               <button type="button" class="color-choice lavender selected" data-color="lavender" aria-label="Lavender" title="Lavender"></button>
               <button type="button" class="color-choice mint" data-color="mint" aria-label="Mint" title="Mint"></button>
