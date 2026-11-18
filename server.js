@@ -23,7 +23,7 @@ const DRIVE_AUTO_SYNC_DELAY_MS = Number(process.env.DRIVE_AUTO_SYNC_DELAY_MS || 
 const CALENDAR_SYNC_INTERVAL_MS = Number(process.env.CALENDAR_SYNC_INTERVAL_MS || 300000);
 const TASK_SYNC_INTERVAL_MS = Number(process.env.TASK_SYNC_INTERVAL_MS || 60000);
 const SESSION_MAX_AGE = 1000 * 60 * 60 * 24 * 365;
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.6.0';
 
 if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.includes('replace-with')) {
   throw new Error('Set SESSION_SECRET in your .env file before starting the app.');
@@ -72,6 +72,8 @@ db.exec(`
     title TEXT NOT NULL,
     notes TEXT NOT NULL DEFAULT '',
     color TEXT NOT NULL DEFAULT 'lavender',
+    icon_name TEXT NOT NULL DEFAULT '',
+    icon_color TEXT NOT NULL DEFAULT '',
     type TEXT NOT NULL CHECK(type IN ('frequency', 'interval')),
     min_count INTEGER,
     max_count INTEGER,
@@ -85,6 +87,7 @@ db.exec(`
     progressive INTEGER NOT NULL DEFAULT 1,
     linked_to_routine_id TEXT,
     linked_offset_days INTEGER NOT NULL DEFAULT -1,
+    linked_completed_anchor TEXT,
     archived INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -101,7 +104,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS google_tasks (
     account_key TEXT NOT NULL REFERENCES google_accounts(account_key) ON DELETE CASCADE,
     routine_id TEXT NOT NULL, slot_key TEXT NOT NULL, task_id TEXT NOT NULL, due_date TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'needsAction', updated_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'needsAction', updated_at TEXT NOT NULL, completion_id TEXT,
     PRIMARY KEY(account_key, routine_id, slot_key)
   );
   CREATE TABLE IF NOT EXISTS google_events (
@@ -141,6 +144,10 @@ function ensureColumn(tableName, columnName, definition) {
 ensureColumn('routines', 'progressive', 'INTEGER NOT NULL DEFAULT 1');
 ensureColumn('routines', 'linked_to_routine_id', 'TEXT');
 ensureColumn('routines', 'linked_offset_days', 'INTEGER NOT NULL DEFAULT -1');
+ensureColumn('routines', 'linked_completed_anchor', 'TEXT');
+ensureColumn('google_tasks', 'completion_id', 'TEXT');
+ensureColumn('routines', 'icon_name', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('routines', 'icon_color', "TEXT NOT NULL DEFAULT ''");
 
 function nowIso() { return new Date().toISOString(); }
 function makeId(prefix = 'r') { return `${prefix}_${crypto.randomUUID()}`; }
@@ -209,13 +216,17 @@ function addOffsetDays(dateLike, offsetDays) {
 function updateLinkedRoutineSchedules(userId, sourceRoutineId) {
   const source = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=?').get(sourceRoutineId, userId);
   const children = db.prepare('SELECT * FROM routines WHERE user_id=? AND linked_to_routine_id=? AND archived=0').all(userId, sourceRoutineId);
+  const anchor = source && !source.archived ? getRoutineAnchorDate(source) : null;
+  let anyChanged = false;
   for (const child of children) {
-    const nextDue = source && !source.archived && source.next_due_at
-      ? addOffsetDays(source.next_due_at, child.linked_offset_days || 0).toISOString()
-      : null;
-    db.prepare('UPDATE routines SET next_due_at=?,updated_at=? WHERE id=? AND user_id=?')
+    const nextDue = anchor ? addOffsetDays(anchor, child.linked_offset_days || 0).toISOString() : null;
+    const changed = (child.next_due_at || null) !== nextDue;
+    if (!changed) continue;
+    anyChanged = true;
+    db.prepare('UPDATE routines SET next_due_at=?,linked_completed_anchor=NULL,updated_at=? WHERE id=? AND user_id=?')
       .run(nextDue, nowIso(), child.id, userId);
   }
+  if (anyChanged) queueDriveSync(userId);
 }
 
 function getCurrentPeriod(routine, now = new Date()) {
@@ -249,6 +260,21 @@ function getCurrentPeriod(routine, now = new Date()) {
   }
   return { start, end };
 }
+
+function getRoutineAnchorDate(routine, now = new Date()) {
+  if (!routine || routine.archived) return null;
+  if (routine.type === 'interval') return routine.next_due_at ? new Date(routine.next_due_at) : null;
+  if (routine.type !== 'frequency') return null;
+  const window = getCurrentPeriod(routine, now);
+  const count = db.prepare(`SELECT COUNT(*) AS n FROM completions WHERE routine_id=? AND completed_at>=? AND completed_at<?`)
+    .get(routine.id, window.start.toISOString(), window.end.toISOString()).n;
+  const maxCount = Math.max(1, Number(routine.max_count || 1));
+  if (Number(count || 0) >= maxCount) return window.end;
+  if (!parseBooleanFlag(routine.progressive, true)) return window.start;
+  const duration = Math.max(1, window.end.getTime() - window.start.getTime());
+  return new Date(window.start.getTime() + duration * (Number(count || 0) / maxCount));
+}
+
 function unitLabel(unit, plural = true) {
   const labels = { days: plural ? 'days' : 'day', weeks: plural ? 'weeks' : 'week', months: plural ? 'months' : 'month', years: plural ? 'years' : 'year' };
   return labels[unit] || unit;
@@ -439,6 +465,7 @@ async function syncRoutineTasks(userId, routines = listRoutines(userId)) {
         .get(account.account_key, routine.id);
     }
     const requestBody = { title: routine.title, notes: routine.notes || 'Routine Tracker checklist item', due: `${dueDate}T00:00:00.000Z` };
+    if (existing && existing.status === 'deleted') continue;
     if (existing) {
       if (existing.status === 'completed') {
         await tasks.tasks.patch({ tasklist: '@default', task: existing.task_id, requestBody: { ...requestBody, status: 'needsAction' } });
@@ -467,10 +494,12 @@ async function completeCurrentGoogleTask(userId, routine) {
   if (!row) return;
   await tasksApi(account.account_key).tasks.patch({ tasklist: '@default', task: row.task_id, requestBody: { status: 'completed', completed: nowIso() } });
   db.prepare('UPDATE google_tasks SET status=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?').run('completed', nowIso(), account.account_key, routine.id, row.slot_key);
+  return { ...row, account_key: account.account_key };
 }
 
 function publicRoutine(routine, now = new Date()) {
-  const item = { ...routine, archived: Boolean(routine.archived), progressive: routine.progressive !== 0 };
+  const progressive = parseBooleanFlag(routine.progressive, true);
+  const item = { ...routine, archived: Boolean(routine.archived), progressive };
   if (routine.type === 'frequency') {
     const window = getCurrentPeriod(routine, now);
     const count = db.prepare(`SELECT COUNT(*) AS n FROM completions
@@ -479,27 +508,49 @@ function publicRoutine(routine, now = new Date()) {
     const duration = Math.max(1, window.end.getTime() - window.start.getTime());
     const hasStarted = now.getTime() >= window.start.getTime();
     const elapsedFraction = Math.max(0, Math.min(1, (now.getTime() - window.start.getTime()) / duration));
-    const unlockedCount = !hasStarted ? 0 : routine.progressive === 0
-      ? routine.max_count
-      : Math.min(routine.max_count, Math.max(1, Math.floor(elapsedFraction * routine.max_count + 1e-9) + 1));
-    const nextUnlock = !hasStarted
-      ? window.start
-      : routine.progressive === 0
-        ? window.start
-        : new Date(window.start.getTime() + duration * Math.min(routine.max_count - 1, count) / routine.max_count);
-    const checkinAvailable = hasStarted && count < unlockedCount && count < routine.max_count;
-    const nextOpportunityAt = checkinAvailable ? now.toISOString() : nextUnlock.toISOString();
+    const maxCount = Math.max(1, Number(routine.max_count || 1));
+    const completedCount = Math.min(maxCount, Number(count || 0));
+
+    // Progressive is a visibility schedule only. It determines when the next
+    // checklist/Calendar/Google Task item appears; it does not prohibit a user
+    // from manually logging an early completion from the routine card.
+    const frequencyUnlock = completedCount >= maxCount
+      ? null
+      : progressive
+        ? new Date(window.start.getTime() + duration * (completedCount / maxCount))
+        : window.start;
+    const linkedDue = routine.linked_to_routine_id && routine.next_due_at ? new Date(routine.next_due_at) : null;
+    const linkedDoneForThisAnchor = Boolean(routine.linked_to_routine_id && routine.linked_completed_anchor && routine.next_due_at && routine.linked_completed_anchor === routine.next_due_at);
+    const nextUnlock = completedCount >= maxCount || linkedDoneForThisAnchor
+      ? null
+      : linkedDue && frequencyUnlock
+        ? new Date(Math.max(frequencyUnlock.getTime(), linkedDue.getTime()))
+        : frequencyUnlock;
+    const linkedReady = !routine.linked_to_routine_id || (linkedDue && now.getTime() >= linkedDue.getTime() && !linkedDoneForThisAnchor);
+    const checkinAvailable = completedCount < maxCount && hasStarted && linkedReady && (!progressive || now.getTime() >= frequencyUnlock.getTime());
+    const nextOpportunityAt = completedCount >= maxCount || linkedDoneForThisAnchor
+      ? null
+      : (checkinAvailable ? now.toISOString() : (nextUnlock ? nextUnlock.toISOString() : null));
+
     item.periodStart = window.start.toISOString();
     item.periodEnd = window.end.toISOString();
-    item.completedCount = count;
-    item.minimumReached = count >= routine.min_count;
-    item.maximumReached = count >= routine.max_count;
-    item.remainingMinimum = Math.max(0, routine.min_count - count);
-    item.progress = Math.min(100, Math.round((count / Math.max(1, routine.max_count)) * 100));
-    item.unlockedCount = unlockedCount;
+    item.completedCount = completedCount;
+    item.minimumReached = completedCount >= Number(routine.min_count || 1);
+    item.maximumReached = completedCount >= maxCount;
+    item.remainingMinimum = Math.max(0, Number(routine.min_count || 1) - completedCount);
+    item.progress = Math.min(100, Math.round((completedCount / maxCount) * 100));
+    item.unlockedCount = progressive
+      ? Math.min(maxCount, Math.max(completedCount, hasStarted ? Math.floor(elapsedFraction * maxCount + 1e-9) + 1 : 0))
+      : maxCount;
     item.checkinAvailable = checkinAvailable;
+    item.nextUnlockAt = nextUnlock ? nextUnlock.toISOString() : null;
     item.nextOpportunityAt = nextOpportunityAt;
     item.cadenceLabel = `${routine.min_count}${routine.max_count > routine.min_count ? `–${routine.max_count}` : ''} times every ${routine.period_value} ${unitLabel(routine.period_unit)}`;
+    if (routine.linked_to_routine_id) {
+      const parent = db.prepare('SELECT title FROM routines WHERE id=? AND user_id=?').get(routine.linked_to_routine_id, routine.user_id);
+      item.linkedRoutineTitle = parent?.title || 'Linked routine';
+      item.cadenceLabel += ` · Linked ${routine.linked_offset_days < 0 ? 'before' : 'after'} ${item.linkedRoutineTitle}`;
+    }
   } else {
     const due = routine.next_due_at ? new Date(routine.next_due_at) : null;
     const alreadyDoneForLinkedOccurrence = Boolean(routine.linked_to_routine_id && routine.last_completed_at && due && new Date(routine.last_completed_at) >= due);
@@ -516,6 +567,12 @@ function publicRoutine(routine, now = new Date()) {
   return item;
 }
 function listRoutines(userId, includeArchived = false) {
+  // Keep linked child dates aligned with their parent's next occurrence even
+  // when a frequency period rolls over while the user is away from the app.
+  const parentRows = db.prepare(`SELECT DISTINCT p.id FROM routines p JOIN routines c
+    ON c.linked_to_routine_id=p.id AND c.user_id=p.user_id AND c.archived=0
+    WHERE p.user_id=? AND p.archived=0`).all(userId);
+  for (const parent of parentRows) updateLinkedRoutineSchedules(userId, parent.id);
   const rows = db.prepare(`SELECT * FROM routines WHERE user_id = ? ${includeArchived ? '' : 'AND archived = 0'} ORDER BY created_at DESC`).all(userId);
   return rows.map((row) => publicRoutine(row));
 }
@@ -657,26 +714,26 @@ async function restoreDriveBackup(userId) {
       routineIdMap.set(sourceId, targetId);
       const values = {
         id: targetId, user_id: userId, title: String(r.title).slice(0, 120), notes: String(r.notes || ''),
-        color: r.color || 'lavender', type: r.type, min_count: r.min_count ?? null, max_count: r.max_count ?? null,
+        color: r.color || 'lavender', icon_name: r.icon_name || '', icon_color: r.icon_color || '', type: r.type, min_count: r.min_count ?? null, max_count: r.max_count ?? null,
         period_value: r.period_value ?? null, period_unit: r.period_unit ?? null,
         interval_value: r.interval_value ?? null, interval_unit: r.interval_unit ?? null,
         start_at: r.start_at ?? null, last_completed_at: r.last_completed_at ?? null,
-        next_due_at: r.next_due_at ?? null, progressive: r.progressive ?? 1, linked_to_routine_id: r.linked_to_routine_id ?? null, linked_offset_days: r.linked_offset_days ?? -1, archived: r.archived ? 1 : 0,
+        next_due_at: r.next_due_at ?? null, progressive: r.progressive ?? 1, linked_to_routine_id: r.linked_to_routine_id ?? null, linked_offset_days: r.linked_offset_days ?? -1, linked_completed_anchor: r.linked_completed_anchor ?? null, archived: r.archived ? 1 : 0,
         created_at: r.created_at || nowIso(), updated_at: r.updated_at || nowIso()
       };
       if (existing && targetId === sourceId) {
-        db.prepare(`UPDATE routines SET title=@title,notes=@notes,color=@color,type=@type,min_count=@min_count,
+        db.prepare(`UPDATE routines SET title=@title,notes=@notes,color=@color,icon_name=@icon_name,icon_color=@icon_color,type=@type,min_count=@min_count,
           max_count=@max_count,period_value=@period_value,period_unit=@period_unit,interval_value=@interval_value,
-          interval_unit=@interval_unit,start_at=@start_at,last_completed_at=@last_completed_at,next_due_at=@next_due_at,progressive=@progressive,linked_to_routine_id=@linked_to_routine_id,linked_offset_days=@linked_offset_days,
+          interval_unit=@interval_unit,start_at=@start_at,last_completed_at=@last_completed_at,next_due_at=@next_due_at,progressive=@progressive,linked_to_routine_id=@linked_to_routine_id,linked_offset_days=@linked_offset_days,linked_completed_anchor=@linked_completed_anchor,
           archived=@archived,updated_at=@updated_at WHERE id=@id AND user_id=@user_id AND updated_at < @updated_at`)
           .run(values);
       } else {
         db.prepare(`INSERT OR IGNORE INTO routines(
-          id,user_id,title,notes,color,type,min_count,max_count,period_value,period_unit,
-          interval_value,interval_unit,start_at,last_completed_at,next_due_at,progressive,linked_to_routine_id,linked_offset_days,archived,created_at,updated_at
+          id,user_id,title,notes,color,icon_name,icon_color,type,min_count,max_count,period_value,period_unit,
+          interval_value,interval_unit,start_at,last_completed_at,next_due_at,progressive,linked_to_routine_id,linked_offset_days,linked_completed_anchor,archived,created_at,updated_at
         ) VALUES(
-          @id,@user_id,@title,@notes,@color,@type,@min_count,@max_count,@period_value,@period_unit,
-          @interval_value,@interval_unit,@start_at,@last_completed_at,@next_due_at,@progressive,@linked_to_routine_id,@linked_offset_days,@archived,@created_at,@updated_at
+          @id,@user_id,@title,@notes,@color,@icon_name,@icon_color,@type,@min_count,@max_count,@period_value,@period_unit,
+          @interval_value,@interval_unit,@start_at,@last_completed_at,@next_due_at,@progressive,@linked_to_routine_id,@linked_offset_days,@linked_completed_anchor,@archived,@created_at,@updated_at
         )`).run(values);
       }
       routineCount++;
@@ -760,14 +817,61 @@ async function syncCalendarForAccount(accountKey, attempt = 0) {
   }
 }
 
+function parseBooleanFlag(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return Boolean(fallback);
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  const normalized = String(value).trim().toLowerCase();
+  if (['false', '0', 'off', 'no', 'unchecked', ''].includes(normalized)) return false;
+  if (['true', '1', 'on', 'yes', 'checked'].includes(normalized)) return true;
+  return Boolean(fallback);
+}
+function normalizeHexColor(value, fallback = '#c4b5fd') {
+  const text = String(value || '').trim().toLowerCase();
+  if (/^#[0-9a-f]{6}$/.test(text)) return text;
+  if (/^#[0-9a-f]{3}$/.test(text)) return `#${text[1]}${text[1]}${text[2]}${text[2]}${text[3]}${text[3]}`;
+  return fallback;
+}
+const ROUTINE_COLOR_PRESETS = new Set(['lavender', 'mint', 'peach', 'blue', 'rose', 'gold']);
+const ROUTINE_COLOR_HEX = { lavender: '#a895f0', mint: '#72c6a0', peach: '#e9a77f', blue: '#84a8df', rose: '#d98eaa', gold: '#d8b85d' };
+const ROUTINE_ICON_NAMES = new Set([
+  'sparkles','leaf','sprout','droplet','flower','sun','moon','bed','bath','book','heart','dumbbell',
+  'pill','glass-water','apple','footprints','house','shirt','spray-can','clock','hand','smile','wind',
+  'cloud','flame','star','music','laptop','wallet','shopping-bag','broom','recycle','camera','scissors',
+  'notebook','pen','bike','paw','cooking-pot','utensils','sunrise','waves','mountain','tree','soap',
+  'bottle','meditation','gift','clipboard','shield','target','running','stethoscope','tooth','coffee',
+  'calendar','check-circle','alarm-clock','washing-machine','plant','water','comb','mirror','syringe'
+]);
+
 function parseRoutineBody(body, existing = null) {
-  const type = body.type || (existing && existing.type);
+  const type = body.type || existing?.type;
   if (!['frequency', 'interval'].includes(type)) throw new Error('Choose a valid routine type.');
   const title = String(body.title ?? existing?.title ?? '').trim().slice(0, 120);
   if (!title) throw new Error('Give your routine a name.');
-  const colorOptions = ['lavender', 'mint', 'peach', 'blue', 'rose', 'gold'];
-  const color = colorOptions.includes(body.color || existing?.color) ? (body.color || existing.color) : 'lavender';
-  const common = { title, notes: String(body.notes ?? existing?.notes ?? '').trim().slice(0, 1200), color, type };
+  const rawColor = body.color ?? existing?.color ?? 'lavender';
+  const color = ROUTINE_COLOR_PRESETS.has(String(rawColor)) ? String(rawColor) : normalizeHexColor(rawColor, 'lavender');
+  const rawIcon = String(body.iconName ?? existing?.icon_name ?? 'sparkles').trim().toLowerCase();
+  const iconName = ROUTINE_ICON_NAMES.has(rawIcon) ? rawIcon : 'sparkles';
+  const iconColor = /^#[0-9a-f]{3,6}$/i.test(color) ? normalizeHexColor(color) : (ROUTINE_COLOR_HEX[color] || '#a895f0');
+  const common = { title, notes: String(body.notes ?? existing?.notes ?? '').trim().slice(0, 1200), color, icon_name: iconName, icon_color: iconColor, type };
+
+  const hasLinkedValue = Object.prototype.hasOwnProperty.call(body, 'linkedToRoutineId');
+  const linkedId = hasLinkedValue ? (body.linkedToRoutineId ? String(body.linkedToRoutineId) : null) : (existing?.linked_to_routine_id || null);
+  const linkedOffsetDays = Number(body.linkedOffsetDays ?? existing?.linked_offset_days ?? -1);
+  if (!Number.isInteger(linkedOffsetDays) || Math.abs(linkedOffsetDays) > 3650) throw new Error('Linked offset must be a whole number between -3650 and 3650 days.');
+  let linkedParent = null;
+  let linkedNextDueAt = null;
+  if (linkedId) {
+    if (linkedId === existing?.id) throw new Error('A routine cannot be linked to itself.');
+    if (existing && db.prepare('SELECT 1 FROM routines WHERE user_id=? AND linked_to_routine_id=? AND archived=0 LIMIT 1').get(existing.user_id, existing.id)) {
+      throw new Error('A routine that already has linked routines cannot itself be linked.');
+    }
+    linkedParent = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=? AND archived=0').get(linkedId, body.userId || existing?.user_id);
+    if (!linkedParent || linkedParent.linked_to_routine_id) throw new Error('Choose an active routine that is not itself linked.');
+    const anchor = getRoutineAnchorDate(linkedParent);
+    linkedNextDueAt = anchor ? addOffsetDays(anchor, linkedOffsetDays).toISOString() : null;
+  }
+
   if (type === 'frequency') {
     const minCount = Number(body.minCount ?? existing?.min_count ?? 2);
     const maxCount = Number(body.maxCount ?? existing?.max_count ?? minCount);
@@ -778,12 +882,16 @@ function parseRoutineBody(body, existing = null) {
     if (!Number.isInteger(periodValue) || periodValue < 1 || periodValue > 365) throw new Error('Frequency period must be from 1 to 365.');
     if (!['days', 'weeks', 'months'].includes(periodUnit)) throw new Error('Choose a valid frequency period.');
     const startAt = toIso(body.startAt ?? existing?.start_at, nowIso());
-    const progressive = body.progressive !== undefined ? (body.progressive ? 1 : 0) : (existing?.progressive ?? 1);
+    const progressive = Object.prototype.hasOwnProperty.call(body, 'progressive')
+      ? (parseBooleanFlag(body.progressive, true) ? 1 : 0)
+      : (parseBooleanFlag(existing?.progressive, true) ? 1 : 0);
     return { ...common, min_count: minCount, max_count: maxCount, period_value: periodValue, period_unit: periodUnit,
       interval_value: null, interval_unit: null, start_at: startAt, progressive,
-      linked_to_routine_id: null, linked_offset_days: -1,
-      last_completed_at: null, next_due_at: null };
+      linked_to_routine_id: linkedId, linked_offset_days: linkedOffsetDays,
+      linked_completed_anchor: linkedId ? (linkedId === existing?.linked_to_routine_id ? (existing?.linked_completed_anchor || null) : null) : null,
+      last_completed_at: existing?.last_completed_at || null, next_due_at: linkedId ? linkedNextDueAt : null };
   }
+
   const intervalValue = Number(body.intervalValue ?? existing?.interval_value ?? 2);
   const intervalUnit = body.intervalUnit || existing?.interval_unit || 'weeks';
   if (!Number.isInteger(intervalValue) || intervalValue < 1 || intervalValue > 3650) throw new Error('Repeat interval must be from 1 to 3650.');
@@ -791,29 +899,14 @@ function parseRoutineBody(body, existing = null) {
   const suppliedLast = Object.prototype.hasOwnProperty.call(body, 'lastCompletedAt');
   const lastRaw = suppliedLast ? body.lastCompletedAt : existing?.last_completed_at;
   const lastCompletedAt = lastRaw ? toIso(lastRaw, null) : null;
-  const linkedId = Object.prototype.hasOwnProperty.call(body, 'linkedToRoutineId')
-    ? (body.linkedToRoutineId ? String(body.linkedToRoutineId) : null)
-    : (existing?.linked_to_routine_id || null);
-  const linkedOffsetDays = Number(body.linkedOffsetDays ?? existing?.linked_offset_days ?? -1);
-  if (!Number.isInteger(linkedOffsetDays) || Math.abs(linkedOffsetDays) > 3650) throw new Error('Linked offset must be a whole number between -3650 and 3650 days.');
-  let nextDueAt;
-  if (linkedId) {
-    if (linkedId === existing?.id) throw new Error('A routine cannot be linked to itself.');
-    if (existing && db.prepare('SELECT 1 FROM routines WHERE user_id=? AND linked_to_routine_id=? AND archived=0 LIMIT 1').get(body.userId, existing.id)) {
-      throw new Error('This routine already has linked routines and cannot itself be linked.');
-    }
-    const parent = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=? AND archived=0').get(linkedId, body.userId || existing?.user_id);
-    if (!parent || parent.type !== 'interval' || parent.linked_to_routine_id) throw new Error('Choose an active, unlinked repeat-after routine to link to.');
-    nextDueAt = parent.next_due_at ? addOffsetDays(parent.next_due_at, linkedOffsetDays).toISOString() : null;
-  } else if (lastCompletedAt) {
-    nextDueAt = addInterval(lastCompletedAt, intervalValue, intervalUnit).toISOString();
-  } else {
-    nextDueAt = toIso(body.nextDueAt ?? existing?.next_due_at, nowIso());
-  }
+  const nextDueAt = linkedId ? linkedNextDueAt : lastCompletedAt
+    ? addInterval(lastCompletedAt, intervalValue, intervalUnit).toISOString()
+    : toIso(body.nextDueAt ?? existing?.next_due_at, nowIso());
   return { ...common, min_count: null, max_count: null, period_value: null, period_unit: null,
     interval_value: intervalValue, interval_unit: intervalUnit, start_at: null, progressive: 1,
     linked_to_routine_id: linkedId, linked_offset_days: linkedOffsetDays,
-    last_completed_at: linkedId ? (existing?.last_completed_at || null) : lastCompletedAt, next_due_at: nextDueAt };
+    linked_completed_anchor: linkedId ? (linkedId === existing?.linked_to_routine_id ? (existing?.linked_completed_anchor || null) : null) : null,
+    last_completed_at: lastCompletedAt, next_due_at: nextDueAt };
 }
 
 app.get('/auth/google', (req, res, next) => {
@@ -917,11 +1010,11 @@ app.post('/api/routines', (req, res) => {
     const id = makeId('routine');
     const stamp = nowIso();
     db.prepare(`INSERT INTO routines(
-      id,user_id,title,notes,color,type,min_count,max_count,period_value,period_unit,
-      interval_value,interval_unit,start_at,last_completed_at,next_due_at,progressive,linked_to_routine_id,linked_offset_days,created_at,updated_at
+      id,user_id,title,notes,color,icon_name,icon_color,type,min_count,max_count,period_value,period_unit,
+      interval_value,interval_unit,start_at,last_completed_at,next_due_at,progressive,linked_to_routine_id,linked_offset_days,linked_completed_anchor,created_at,updated_at
     ) VALUES(
-      @id,@user_id,@title,@notes,@color,@type,@min_count,@max_count,@period_value,@period_unit,
-      @interval_value,@interval_unit,@start_at,@last_completed_at,@next_due_at,@progressive,@linked_to_routine_id,@linked_offset_days,@created_at,@updated_at
+      @id,@user_id,@title,@notes,@color,@icon_name,@icon_color,@type,@min_count,@max_count,@period_value,@period_unit,
+      @interval_value,@interval_unit,@start_at,@last_completed_at,@next_due_at,@progressive,@linked_to_routine_id,@linked_offset_days,@linked_completed_anchor,@created_at,@updated_at
     )`).run({ id, user_id: req.userId, ...data, created_at: stamp, updated_at: stamp });
     if (!data.linked_to_routine_id) updateLinkedRoutineSchedules(req.userId, id);
     queueDriveSync(req.userId);
@@ -933,9 +1026,9 @@ app.patch('/api/routines/:id', (req, res) => {
     const existing = db.prepare('SELECT * FROM routines WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
     if (!existing) return res.status(404).json({ error: 'Routine not found.' });
     const data = parseRoutineBody({ ...req.body, type: existing.type, userId: req.userId }, existing);
-    db.prepare(`UPDATE routines SET title=@title,notes=@notes,color=@color,min_count=@min_count,max_count=@max_count,
+    db.prepare(`UPDATE routines SET title=@title,notes=@notes,color=@color,icon_name=@icon_name,icon_color=@icon_color,min_count=@min_count,max_count=@max_count,
       period_value=@period_value,period_unit=@period_unit,interval_value=@interval_value,interval_unit=@interval_unit,
-      start_at=@start_at,last_completed_at=@last_completed_at,next_due_at=@next_due_at,progressive=@progressive,linked_to_routine_id=@linked_to_routine_id,linked_offset_days=@linked_offset_days,updated_at=@updated_at
+      start_at=@start_at,last_completed_at=@last_completed_at,next_due_at=@next_due_at,progressive=@progressive,linked_to_routine_id=@linked_to_routine_id,linked_offset_days=@linked_offset_days,linked_completed_anchor=@linked_completed_anchor,updated_at=@updated_at
       WHERE id=@id AND user_id=@user_id`).run({ ...data, updated_at: nowIso(), id: existing.id, user_id: req.userId });
     if (!data.linked_to_routine_id) updateLinkedRoutineSchedules(req.userId, existing.id);
     queueDriveSync(req.userId);
@@ -955,13 +1048,16 @@ app.post('/api/routines/:id/complete', async (req, res) => {
     const routine = db.prepare('SELECT * FROM routines WHERE id = ? AND user_id = ? AND archived = 0').get(req.params.id, req.userId);
     if (!routine) return res.status(404).json({ error: 'Routine not found.' });
     const publicBefore = publicRoutine(routine);
-    if (routine.type === 'frequency' && !publicBefore.checkinAvailable) return res.status(409).json({ error: 'Your next Progressive check-in is not unlocked yet.' });
+    if (routine.type === 'frequency' && publicBefore.maximumReached) return res.status(409).json({ error: 'You have already reached the maximum for this period.' });
     if (routine.type === 'interval' && !publicBefore.isDue) return res.status(409).json({ error: 'This routine is not due yet.' });
-    try { await completeCurrentGoogleTask(req.userId, publicRoutine(routine)); } catch (error) { console.warn('Could not complete Google Task:', error.message); }
+    let completedGoogleTask = null;
+    try { completedGoogleTask = await completeCurrentGoogleTask(req.userId, publicRoutine(routine)); } catch (error) { console.warn('Could not complete Google Task:', error.message); }
     const completedAt = toIso(req.body.completedAt, nowIso());
     const completionId = makeId('done');
     db.prepare('INSERT INTO completions(id,routine_id,user_id,completed_at,note) VALUES(?,?,?,?,?)')
       .run(completionId, routine.id, req.userId, completedAt, String(req.body.note || '').slice(0, 500));
+    if (completedGoogleTask) db.prepare('UPDATE google_tasks SET completion_id=? WHERE account_key=? AND routine_id=? AND slot_key=?')
+      .run(completionId, completedGoogleTask.account_key, routine.id, completedGoogleTask.slot_key);
     if (routine.type === 'interval' && !routine.linked_to_routine_id) {
       const nextDueAt = addInterval(completedAt, routine.interval_value, routine.interval_unit).toISOString();
       db.prepare('UPDATE routines SET last_completed_at=?,next_due_at=?,updated_at=? WHERE id=?')
@@ -970,7 +1066,14 @@ app.post('/api/routines/:id/complete', async (req, res) => {
     } else if (routine.type === 'interval' && routine.linked_to_routine_id) {
       db.prepare('UPDATE routines SET last_completed_at=?,updated_at=? WHERE id=?').run(completedAt, nowIso(), routine.id);
     } else {
-      db.prepare('UPDATE routines SET updated_at=? WHERE id=?').run(nowIso(), routine.id);
+      db.prepare('UPDATE routines SET last_completed_at=?,updated_at=? WHERE id=?').run(completedAt, nowIso(), routine.id);
+    }
+    updateLinkedRoutineSchedules(req.userId, routine.id);
+    if (routine.type === 'frequency') {
+      const afterLog = publicRoutine(db.prepare('SELECT * FROM routines WHERE id=?').get(routine.id));
+      if (routine.linked_to_routine_id && afterLog.maximumReached) {
+        db.prepare('UPDATE routines SET linked_completed_anchor=next_due_at,updated_at=? WHERE id=?').run(nowIso(), routine.id);
+      }
     }
     queueDriveSync(req.userId);
     const updated = db.prepare('SELECT * FROM routines WHERE id = ?').get(routine.id);
@@ -990,6 +1093,28 @@ app.get('/api/history', (req, res) => {
 app.delete('/api/history/:id', async (req, res) => {
   const row = db.prepare('SELECT * FROM completions WHERE id=? AND user_id=?').get(req.params.id, req.userId);
   if (!row) return res.status(404).json({ error: 'Activity not found.' });
+  const account = getCurrentGoogleAccount(req.userId);
+  let linkedTask = account ? db.prepare('SELECT * FROM google_tasks WHERE account_key=? AND completion_id=?').get(account.account_key, row.id) : null;
+  if (!linkedTask && account) {
+    linkedTask = db.prepare(`SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='completed' AND completion_id IS NULL
+      ORDER BY ABS(strftime('%s', updated_at)-strftime('%s', ?)) LIMIT 1`).get(account.account_key, row.routine_id, row.completed_at);
+    if (linkedTask) {
+      const gap = Math.abs(new Date(linkedTask.updated_at).getTime() - new Date(row.completed_at).getTime());
+      if (gap > 24 * 60 * 60 * 1000) linkedTask = null;
+    }
+  }
+  if (linkedTask) {
+    try {
+      await tasksApi(account.account_key).tasks.delete({ tasklist: '@default', task: linkedTask.task_id });
+    } catch (error) {
+      if (Number(error.code || error.response?.status) !== 404) {
+        console.warn('Could not delete linked Google Task:', error.message);
+        return res.status(502).json({ error: 'The activity was not deleted because its Google Task could not be deleted. Check Google connection and try again.' });
+      }
+    }
+    db.prepare("UPDATE google_tasks SET status='deleted',completion_id=NULL,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
+      .run(nowIso(), account.account_key, row.routine_id, linkedTask.slot_key);
+  }
   db.prepare('DELETE FROM completions WHERE id=? AND user_id=?').run(req.params.id, req.userId);
   const routine = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=?').get(row.routine_id, req.userId);
   if (routine && routine.type === 'interval' && !routine.linked_to_routine_id) {
@@ -1001,6 +1126,14 @@ app.delete('/api/history/:id', async (req, res) => {
     const latest = db.prepare('SELECT completed_at FROM completions WHERE routine_id=? ORDER BY completed_at DESC LIMIT 1').get(routine.id);
     db.prepare('UPDATE routines SET last_completed_at=?,updated_at=? WHERE id=?').run(latest?.completed_at || null, nowIso(), routine.id);
   }
+  if (routine && routine.type === 'frequency') {
+    const count = db.prepare('SELECT COUNT(*) AS n FROM completions WHERE routine_id=? AND completed_at>=? AND completed_at<?')
+      .get(routine.id, getCurrentPeriod(routine).start.toISOString(), getCurrentPeriod(routine).end.toISOString()).n;
+    if (routine.linked_to_routine_id && Number(count) < Number(routine.max_count || 1)) {
+      db.prepare('UPDATE routines SET linked_completed_anchor=NULL,updated_at=? WHERE id=?').run(nowIso(), routine.id);
+    }
+  }
+  updateLinkedRoutineSchedules(req.userId, row.routine_id);
   queueDriveSync(req.userId);
   try { await syncRoutineTasks(req.userId); } catch (error) { console.warn('Google Task history-delete sync failed:', error.message); }
   res.json({ ok: true });
@@ -1027,6 +1160,44 @@ app.patch('/api/completions/:id', async (req, res) => {
     if (!completion) return res.status(404).json({ error: 'Completion not found.' });
     const completedAt = toIso(req.body.completedAt, null);
     if (!completedAt) return res.status(400).json({ error: 'Choose a valid completion date.' });
+
+    // A completed Google Task is linked to this exact local completion by
+    // completion_id. Update its due date as well as its completed timestamp so
+    // the completed item moves to the same day in Google Tasks / Calendar.
+    // The Google call is made before changing SQLite, so a real sync failure
+    // does not leave the website and Google showing different dates.
+    const account = getCurrentGoogleAccount(req.userId);
+    let linkedTask = account
+      ? db.prepare('SELECT * FROM google_tasks WHERE account_key=? AND completion_id=?').get(account.account_key, completion.id)
+      : null;
+    let googleTaskUpdated = false;
+    if (linkedTask) {
+      const dateOnly = isoDateOnly(completedAt);
+      try {
+        await tasksApi(account.account_key).tasks.patch({
+          tasklist: '@default',
+          task: linkedTask.task_id,
+          requestBody: {
+            due: `${dateOnly}T00:00:00.000Z`,
+            completed: completedAt
+          }
+        });
+        db.prepare('UPDATE google_tasks SET due_date=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
+          .run(dateOnly, nowIso(), account.account_key, linkedTask.routine_id, linkedTask.slot_key);
+        googleTaskUpdated = true;
+      } catch (error) {
+        if (Number(error.code || error.response?.status) === 404) {
+          // A task removed directly in Google is no longer syncable; retain
+          // the local activity date without trying to recreate a completed task.
+          db.prepare("UPDATE google_tasks SET status='deleted',updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
+            .run(nowIso(), account.account_key, linkedTask.routine_id, linkedTask.slot_key);
+        } else {
+          console.warn('Could not update completed Google Task date:', error.message);
+          return res.status(502).json({ error: 'Google could not update the completed task date. Your activity date was not changed. Reconnect Google Tasks and try again.' });
+        }
+      }
+    }
+
     db.prepare('UPDATE completions SET completed_at=? WHERE id=? AND user_id=?').run(completedAt, completion.id, req.userId);
     const routine = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=?').get(completion.routine_id, req.userId);
     if (routine && routine.type === 'interval' && !routine.linked_to_routine_id) {
@@ -1038,9 +1209,14 @@ app.patch('/api/completions/:id', async (req, res) => {
       const latest = db.prepare('SELECT completed_at FROM completions WHERE routine_id=? ORDER BY completed_at DESC LIMIT 1').get(routine.id);
       db.prepare('UPDATE routines SET last_completed_at=?,updated_at=? WHERE id=?').run(latest?.completed_at || null, nowIso(), routine.id);
     }
+    if (routine && routine.type === 'frequency') {
+      const latest = db.prepare('SELECT completed_at FROM completions WHERE routine_id=? ORDER BY completed_at DESC LIMIT 1').get(routine.id);
+      db.prepare('UPDATE routines SET last_completed_at=?,updated_at=? WHERE id=?').run(latest?.completed_at || null, nowIso(), routine.id);
+    }
+    if (routine) updateLinkedRoutineSchedules(req.userId, routine.id);
     queueDriveSync(req.userId);
-    try { await syncRoutineTasks(req.userId); } catch (error) { console.warn('Google Task completion-date sync failed:', error.message); }
-    res.json({ ok: true });
+    try { await syncRoutineTasks(req.userId); } catch (error) { console.warn('Google Task completion-date follow-up sync failed:', error.message); }
+    res.json({ ok: true, googleTaskUpdated });
   } catch (error) { res.status(400).json({ error: error.message }); }
 });
 
@@ -1073,7 +1249,7 @@ app.get('/api/calendar', async (req, res) => {
         const due = new Date(r.next_due_at);
         if (due >= start && due < end) events.push({ id: `due_${r.id}`, title: `${r.title} · due`, start: r.next_due_at, allDay: true, kind: 'due', routineId: r.id, color: r.color, linked: Boolean(r.linked_to_routine_id), available: due.getTime() <= Date.now() });
       }
-      if (r.type === 'frequency' && !r.maximumReached) {
+      if (r.type === 'frequency' && r.checkinAvailable && !r.maximumReached) {
         const opportunity = new Date(r.nextOpportunityAt || r.periodStart);
         if (opportunity >= start && opportunity < end) events.push({ id: `freq_${r.id}`, title: `${r.title} · check-in`, start: opportunity.toISOString(), allDay: true, kind: 'frequency', routineId: r.id, color: r.color, available: r.checkinAvailable });
       }

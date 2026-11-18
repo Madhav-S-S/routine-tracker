@@ -10,6 +10,9 @@ const state = {
   routineFilter: 'all',
   selectedType: 'frequency',
   selectedColor: 'lavender',
+  selectedIconName: 'sparkles',
+  selectedIconColor: '#a895f0',
+  iconManuallySelected: false,
   calendarMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
   calendarEvents: [],
   calendarWarning: null,
@@ -18,10 +21,147 @@ const state = {
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-const colorSymbols = { lavender: '✧', mint: '✿', peach: '☼', blue: '◈', rose: '♡', gold: '✦' };
+const COLOR_HEX = { lavender: '#a895f0', mint: '#72c6a0', peach: '#e9a77f', blue: '#84a8df', rose: '#d98eaa', gold: '#d8b85d' };
+const COLOR_STORAGE_KEY = 'routine-tracker.saved-colors.v1';
+const ICON_LIBRARY = [
+  ['sparkles','Sparkles','default shine star motivation',`<path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3Z"/><path d="m19 14 .9 2.1L22 17l-2.1.9L19 20l-.9-2.1L16 17l2.1-.9L19 14Z"/>`],
+  ['leaf','Leaf','aloe vera rosemary plant herb skin hair nature',`<path d="M20.5 3.5C12 3.5 5 6.2 5 13a7 7 0 0 0 7 7c6.8 0 8.5-8 8.5-16.5Z"/><path d="M3.5 21c3-5 7-8 13-12"/>`],
+  ['sprout','Sprout','plant grow seed gardening',`<path d="M12 21v-9"/><path d="M12 12C5 12 4 7 4 4c5 0 8 2 8 8Z"/><path d="M12 15c0-6 4-9 8-9 0 5-2 9-8 9Z"/>`],
+  ['droplet','Droplet','water hydration drink skincare',`<path d="M12 22a7 7 0 0 0 7-7c0-4-7-13-7-13S5 11 5 15a7 7 0 0 0 7 7Z"/><path d="M9 16a3 3 0 0 0 3 3"/>`],
+  ['flower','Flower','flower garden blossom',`<circle cx="12" cy="12" r="2.5"/><path d="M12 3c3 0 3 4 0 6-3-2-3-6 0-6ZM21 12c0 3-4 3-6 0 2-3 6-3 6 0ZM12 21c-3 0-3-4 0-6 3 2 3 6 0 6ZM3 12c0-3 4-3 6 0-2 3-6 3-6 0Z"/>`],
+  ['sun','Sun','sunshine outdoor morning',`<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/>`],
+  ['moon','Moon','sleep night rest',`<path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z"/>`],
+  ['bed','Bed','bedsheet sleep bedroom',`<path d="M3 18v-6h18v6M3 12V7h6v5M9 10h7a5 5 0 0 1 5 5"/><path d="M5 18v2m14-2v2"/>`],
+  ['bath','Bath','bath bathing shower clean',`<path d="M3 12h18v4a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4v-4Z"/><path d="M7 12V7a3 3 0 0 1 6 0v1M5 20v1m14-1v1"/>`],
+  ['book','Book','read reading study learning',`<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v17H6.5A2.5 2.5 0 0 1 4 17.5v-12Z"/><path d="M4 17.5A2.5 2.5 0 0 1 6.5 15H20M8 7h8m-8 3h6"/>`],
+  ['heart','Heart','health love care wellness',`<path d="M20.8 8.8c0 5-8.8 11-8.8 11s-8.8-6-8.8-11A4.8 4.8 0 0 1 12 6a4.8 4.8 0 0 1 8.8 2.8Z"/>`],
+  ['dumbbell','Dumbbell','gym exercise workout fitness',`<path d="M6 7v10M3.5 9v6M18 7v10m2.5-8v6M6 12h12"/>`],
+  ['pill','Pill','medicine medication supplement',`<path d="M4.9 19.1a6 6 0 0 1 0-8.5l5.7-5.7a6 6 0 0 1 8.5 8.5l-5.7 5.7a6 6 0 0 1-8.5 0Z"/><path d="m8 8 8 8"/>`],
+  ['glass-water','Glass of water','water glass drink',`<path d="M5 3h14l-1.5 18h-11L5 3Z"/><path d="M6 13h12"/>`],
+  ['apple','Apple','fruit food nutrition',`<path d="M12 8c-2-4-8-2-8 4 0 5 3 9 6 9 1 0 1.5-.7 2-.7s1 .7 2 .7c3 0 6-4 6-9 0-6-6-8-8-4Z"/><path d="M12 8c0-3 2-5 5-5"/>`],
+  ['footprints','Footprints','walk walking steps',`<path d="M8 4c1.5 0 2 2 1.8 4S8.5 11 7 11 5 9 5 7s1.5-3 3-3ZM16 13c1.5 0 2 2 1.8 4s-1.3 3-2.8 3-2-2-2-4 1.5-3 3-3Z"/><path d="M5 14c-1 1-1 3 0 4m12-9c1 1 1 2 1 3"/>`],
+  ['house','Home','home house chores',`<path d="m3 10 9-7 9 7v10H3V10Z"/><path d="M9 20v-7h6v7"/>`],
+  ['shirt','Shirt','laundry clothes dress',`<path d="m8 4 4 2 4-2 5 3-3 5-3-2v10H9V10l-3 2-3-5 5-3Z"/>`],
+  ['spray-can','Spray bottle','spray cleaning skincare',`<path d="M8 8h8l1 13H7L8 8Z"/><path d="M9 8V5h6v3m-6-3h7l2-2m-1 0h3"/><path d="M18 5h3"/>`],
+  ['clock','Clock','time routine punctual',`<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>`],
+  ['hand','Hand','hands care apply skincare',`<path d="M8 12V6a1.5 1.5 0 0 1 3 0v5-7a1.5 1.5 0 0 1 3 0v7-5a1.5 1.5 0 0 1 3 0v7l1-2a1.7 1.7 0 0 1 3 1l-2 7a5 5 0 0 1-5 4h-2a5 5 0 0 1-4-2l-4-5a1.8 1.8 0 0 1 3-2l2 2"/>`],
+  ['smile','Smile','mood happiness mental health',`<circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"/>`],
+  ['wind','Wind','breathing fresh air',`<path d="M3 8h12a3 3 0 1 0-3-3M2 12h17a3 3 0 1 1-3 3M4 16h7a2 2 0 1 1-2 2"/>`],
+  ['cloud','Cloud','weather calm',`<path d="M7 18h10a4 4 0 0 0 .5-8A6 6 0 0 0 6 9a4.5 4.5 0 0 0 1 9Z"/>`],
+  ['flame','Flame','energy fire',`<path d="M12 22c4 0 7-3 7-7 0-3-2-6-5-9 0 3-1 4-2 5-1-3-3-5-3-5 0 4-4 6-4 10a7 7 0 0 0 7 6Z"/><path d="M10 18c0-2 2-4 3-5 2 3 2 5 0 7-2 0-3-1-3-2Z"/>`],
+  ['star','Star','favorite priority',`<path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9L12 3Z"/>`],
+  ['music','Music','music practice instrument',`<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>`],
+  ['laptop','Laptop','work computer screen',`<rect x="4" y="4" width="16" height="12" rx="1.5"/><path d="M2 20h20l-2-4H4l-2 4Z"/>`],
+  ['wallet','Wallet','money budget finance',`<path d="M4 6h15a2 2 0 0 1 2 2v11H4a2 2 0 0 1-2-2V6a3 3 0 0 1 3-3h13"/><path d="M16 12h5m-4 0h.01"/>`],
+  ['shopping-bag','Shopping bag','shopping errands',`<path d="M4 8h16l-1 13H5L4 8Z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/>`],
+  ['broom','Broom','cleaning sweep',`<path d="m14 3 7 7M13 4l7 7M4 20l10-10M3 21l6-1 3-3-5-5-3 3-1 6Z"/>`],
+  ['recycle','Recycle','recycle environment sustainability',`<path d="m7 7 3-4 3 4M10 3l-3 8h7M17 17l4-1-2 5M21 16l-8 2 4-7M5 15l-3 3 4 3M2 18l7 3 3-6"/>`],
+  ['camera','Camera','photo photography',`<path d="M4 7h4l2-3h4l2 3h4v13H4V7Z"/><circle cx="12" cy="13" r="4"/>`],
+  ['scissors','Scissors','cut hair grooming',`<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="m8.2 8.2 12 12m-12-4.4 12-12"/>`],
+  ['notebook','Notebook','journal notes diary',`<rect x="5" y="3" width="15" height="18" rx="2"/><path d="M9 3v18M2 7h3m-3 5h3m-3 5h3m4-10h7m-7 4h7"/>`],
+  ['pen','Pen','write writing notes',`<path d="m4 20 4-.8L20 7a2.8 2.8 0 0 0-4-4L4 15l-.8 4Z"/><path d="m14 5 5 5"/>`],
+  ['bike','Bicycle','cycling cycling fitness',`<circle cx="6" cy="17" r="4"/><circle cx="18" cy="17" r="4"/><path d="m6 17 4-8h4l4 8m-8-8 4 8H6m5-11h3"/>`],
+  ['paw','Paw','pet dog cat animal',`<ellipse cx="12" cy="16" rx="5" ry="4"/><circle cx="5" cy="9" r="2"/><circle cx="10" cy="6" r="2"/><circle cx="15" cy="6" r="2"/><circle cx="20" cy="9" r="2"/>`],
+  ['cooking-pot','Cooking pot','cook cooking meal food',`<path d="M4 10h16v8a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3v-8ZM2 10h20M9 6h6M12 3v3"/>`],
+  ['utensils','Utensils','food eating kitchen',`<path d="M7 3v7m-3-7v4a3 3 0 0 0 6 0V3m-3 8v10M17 3v18m0-18c3 2 3 7 0 9"/>`],
+  ['sunrise','Sunrise','morning wake up',`<path d="M3 18h18M5 21h14M12 3v5m-7-1 3 3m11-3-3 3M4 14a8 8 0 0 1 16 0"/>`],
+  ['waves','Waves','swim sea ocean',`<path d="M2 8c2 0 2-2 4-2s2 2 4 2 2-2 4-2 2 2 4 2 2-2 4-2M2 16c2 0 2-2 4-2s2 2 4 2 2-2 4-2 2 2 4 2 2-2 4-2"/>`],
+  ['mountain','Mountain','hiking outdoors nature',`<path d="m2 20 7-12 4 6 3-4 6 10H2Z"/><path d="m7 12 2 2 2-1"/>`],
+  ['tree','Tree','nature outdoors garden',`<path d="M12 22v-7m0-12 7 8h-4l5 5H4l5-5H5l7-8Z"/>`],
+  ['soap','Soap','wash hygiene skincare',`<path d="M5 9h14l-1 12H6L5 9Z"/><path d="M8 6c0-2 2-2 2-4m4 4c0-2 2-2 2-4M9 13h6"/>`],
+  ['bottle','Bottle','bottle oil serum lotion',`<path d="M9 3h6v4l2 2v12H7V9l2-2V3Z"/><path d="M9 7h6M7 12h10"/>`],
+  ['meditation','Meditation','meditate yoga mindfulness',`<circle cx="12" cy="5" r="2"/><path d="M12 8v5m-6 7a6 6 0 0 1 12 0M6 13l-3 4m15-4 3 4M8 16h8"/>`],
+  ['gift','Gift','reward treat',`<rect x="3" y="9" width="18" height="12" rx="2"/><path d="M2 9h20v4H2zM12 9v12m0-12H8a2.5 2.5 0 1 1 2.5-2.5L12 9Zm0 0h4a2.5 2.5 0 1 0-2.5-2.5L12 9Z"/>`],
+  ['clipboard','Clipboard','task checklist plan',`<rect x="5" y="4" width="14" height="18" rx="2"/><path d="M9 4V2h6v2M8 10h8m-8 4h8m-8 4h5"/>`],
+  ['shield','Shield','protection safety',`<path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z"/><path d="m9 12 2 2 4-4"/>`],
+  ['target','Target','goal focus objective',`<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>`],
+  ['running','Running','run jog steps',`<circle cx="15" cy="5" r="2"/><path d="m12 9-3 4 4 2 2 5m-6-7-4 1m7-5 4 2 3 1m-9 3-3 6"/>`],
+  ['stethoscope','Stethoscope','doctor health medical',`<path d="M6 3v6a4 4 0 0 0 8 0V3M4 3h4m4 0h4m-2 6v4a5 5 0 0 0 10 0v-1"/><circle cx="20" cy="10" r="2"/>`],
+  ['tooth','Tooth','dental dentist teeth',`<path d="M7 3C4 3 3 6 4 10l2 9c.5 2 2 2 3 0l2-5c.5-1 1.5-1 2 0l2 5c1 2 2.5 2 3 0l2-9c1-4 0-7-3-7-2 0-3 1-5 1S9 3 7 3Z"/>`],
+  ['coffee','Coffee','tea coffee drink',`<path d="M4 8h13v8a4 4 0 0 1-4 4H8a4 4 0 0 1-4-4V8ZM17 10h2a2 2 0 0 1 0 5h-2M7 3v2m4-2v2m4-2v2"/>`],
+  ['calendar','Calendar','schedule date plan',`<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4m10-4v4M3 10h18M7 14h3m3 0h4m-10 4h3"/>`],
+  ['check-circle','Check circle','done complete success',`<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>`],
+  ['alarm-clock','Alarm clock','wake alarm time',`<circle cx="12" cy="13" r="7"/><path d="M12 9v4l3 2M5 3 2 6m17-3 3 3M7 20l-2 2m12-2 2 2"/>`],
+  ['washing-machine','Washing machine','laundry wash clean',`<rect x="4" y="3" width="16" height="18" rx="2"/><circle cx="12" cy="13" r="5"/><path d="M7 7h.01m3 0h.01"/>`],
+  ['comb','Comb','hair grooming brush',`<path d="M4 8h16M6 8v8m3-8v8m3-8v8m3-8v8m3-8v8m3-8v8"/>`],
+  ['mirror','Mirror','face skincare beauty',`<rect x="5" y="2" width="14" height="16" rx="7"/><path d="M12 18v4m-4 0h8"/>`],
+  ['syringe','Syringe','injection medical',`<path d="m4 20 10-10m-7 7-3-3m8-8 6 6m-3-9 6 6M12 4l8 8M3 21l3-1"/>`]
+].map(([name,label,keywords,svg]) => ({ name,label,keywords,svg }));
+const ICON_BY_NAME = Object.fromEntries(ICON_LIBRARY.map((item) => [item.name, item]));
+const ICON_SUGGESTIONS = [
+  [/aloe|rosemary|plant|herb|leaf|skin|hair|oil|serum/i, 'leaf'],
+  [/bath|shower|bathe/i, 'bath'], [/bed|bedsheet|sheet|linen|sleep/i, 'bed'],
+  [/water|drink|hydrate/i, 'droplet'], [/read|book|study|learn/i, 'book'],
+  [/gym|workout|exercise|fitness|lift/i, 'dumbbell'], [/walk|steps/i, 'footprints'],
+  [/run|jog/i, 'running'], [/medicine|tablet|pill|medication/i, 'pill'],
+  [/tooth|teeth|dental|brush teeth/i, 'tooth'], [/clean|sweep|dust|tidy/i, 'broom'],
+  [/wash|laundry|clothes/i, 'washing-machine'], [/cook|meal|food/i, 'cooking-pot'],
+  [/meditat|yoga|mindful|breath/i, 'meditation'], [/journal|diary|write|notes/i, 'notebook'],
+  [/coffee|tea/i, 'coffee'], [/pet|dog|cat/i, 'paw'], [/cycle|bike/i, 'bike'],
+  [/calendar|plan|schedule/i, 'calendar'], [/photo|camera/i, 'camera']
+];
+
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+}
+function resolveColor(value) {
+  const text = String(value || 'lavender').toLowerCase();
+  if (COLOR_HEX[text]) return COLOR_HEX[text];
+  if (/^#[0-9a-f]{6}$/i.test(text)) return text;
+  if (/^#[0-9a-f]{3}$/i.test(text)) return `#${text[1]}${text[1]}${text[2]}${text[2]}${text[3]}${text[3]}`;
+  return COLOR_HEX.lavender;
+}
+function suggestIconName(title) {
+  const text = String(title || '');
+  for (const [pattern, name] of ICON_SUGGESTIONS) if (pattern.test(text)) return name;
+  return 'sparkles';
+}
+function renderRoutineIcon(name, color, size = 20) {
+  const item = ICON_BY_NAME[name] || ICON_BY_NAME.sparkles;
+  const safeColor = resolveColor(color);
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${safeColor}" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${item.svg}</svg>`;
+}
+function readSavedColors() {
+  try {
+    const rows = JSON.parse(localStorage.getItem(COLOR_STORAGE_KEY) || '[]');
+    return Array.isArray(rows) ? rows.filter((color) => /^#[0-9a-f]{6}$/i.test(color)).slice(0, 24) : [];
+  } catch { return []; }
+}
+function saveColorToBrowser(color) {
+  const hex = resolveColor(color).toLowerCase();
+  const colors = readSavedColors().filter((item) => item !== hex);
+  colors.unshift(hex);
+  try { localStorage.setItem(COLOR_STORAGE_KEY, JSON.stringify(colors.slice(0, 24))); }
+  catch { toast('This browser does not allow local color storage.', 'error'); return; }
+  renderSavedColorOptions();
+  toast('Color saved in this browser.');
+}
+function renderSavedColorOptions() {
+  const holder = $('#savedColorOptions');
+  if (!holder) return;
+  const colors = readSavedColors();
+  holder.innerHTML = colors.length ? colors.map((color) => `<button type="button" class="saved-color-choice ${resolveColor(state.selectedColor) === color ? 'selected' : ''}" data-saved-color="${color}" style="--swatch:${color}" title="Use ${color}" aria-label="Use color ${color}"></button>`).join('') : '<small class="saved-colors-empty">Saved colors stay in this browser.</small>';
+}
+function renderIconGrid() {
+  const holder = $('#iconGrid');
+  if (!holder) return;
+  const query = ($('#iconSearch')?.value || '').trim().toLowerCase();
+  const rows = ICON_LIBRARY.filter((item) => !query || `${item.name} ${item.label} ${item.keywords}`.toLowerCase().includes(query));
+  holder.innerHTML = rows.map((item) => `<button type="button" class="icon-choice ${item.name === state.selectedIconName ? 'selected' : ''}" data-icon-name="${item.name}" title="${item.label}" aria-label="${item.label}">${renderRoutineIcon(item.name, state.selectedIconColor, 20)}<small>${item.label}</small></button>`).join('') || '<div class="icon-empty">No icons match that search.</div>';
+}
+function renderIconSelection() {
+  const suggestion = suggestIconName($('#routineTitle')?.value || '');
+  const suggested = ICON_BY_NAME[suggestion] || ICON_BY_NAME.sparkles;
+  $('#iconSuggestionLabel').textContent = `Suggested: ${suggested.label}`;
+  $('#useSuggestedIcon').hidden = state.selectedIconName === suggestion;
+  $('#selectedIconPreview').innerHTML = renderRoutineIcon(state.selectedIconName, state.selectedIconColor, 27);
+  renderIconGrid();
+}
+function selectRoutineIcon(name, manual = true) {
+  state.selectedIconName = ICON_BY_NAME[name] ? name : 'sparkles';
+  state.iconManuallySelected = manual;
+  renderIconSelection();
 }
 function localDateInput(date = new Date()) {
   const y = date.getFullYear();
@@ -175,27 +315,28 @@ function renderStats() {
 function routineStatusText(routine) {
   if (routine.type === 'frequency') {
     if (routine.maximumReached) return 'Target complete';
-    if (!routine.checkinAvailable) return `Next check-in unlocks ${formatDate(routine.nextOpportunityAt, { day: 'numeric', month: 'short' })}`;
+    if (!routine.checkinAvailable) return `Next check-in unlocks ${formatDate(routine.nextUnlockAt || routine.nextOpportunityAt || routine.periodStart, { day: 'numeric', month: 'short' })}`;
     if (routine.minimumReached) return 'Minimum reached';
     return `${routine.remainingMinimum} more to reach minimum`;
   }
   return dueDescription(routine);
 }
 function routineCard(routine) {
-  const color = escapeHtml(routine.color || 'lavender');
-  const symbol = colorSymbols[routine.color] || '✧';
+  const accent = resolveColor(routine.color);
+  const iconTint = accent;
   const isFrequency = routine.type === 'frequency';
   const progress = isFrequency ? (routine.progress || 0) : 0;
   const completed = isFrequency && routine.maximumReached;
-  const canComplete = isFrequency ? Boolean(routine.checkinAvailable) : Boolean(routine.isDue);
+  // Progressive controls checklist visibility, not manual logging permission.
+  const canComplete = isFrequency ? !routine.maximumReached : Boolean(routine.isDue);
   const statusGood = isFrequency ? routine.minimumReached : !routine.isDue;
   const status = routineStatusText(routine);
-  const actionLabel = completed ? 'All done' : isFrequency ? (canComplete ? 'Log a check-in' : 'Not unlocked') : (routine.isDue ? 'Mark complete' : 'Not due yet');
+  const actionLabel = completed ? 'All done' : isFrequency ? (routine.checkinAvailable ? 'Log a check-in' : 'Log early') : (routine.isDue ? 'Mark complete' : 'Not due yet');
   return `
-    <article class="routine-card ${color}" data-routine-card="${escapeHtml(routine.id)}">
+    <article class="routine-card custom-routine-color" style="--routine-accent:${accent};--routine-icon-color:${iconTint}" data-routine-card="${escapeHtml(routine.id)}">
       <div class="routine-top">
-        <div class="routine-symbol ${color}">${symbol}</div>
-        <div class="routine-title-wrap"><h3 title="${escapeHtml(routine.title)}">${escapeHtml(routine.title)}</h3><p>${escapeHtml(isFrequency ? 'Frequency target' : routine.linked_to_routine_id ? 'Linked routine' : 'Repeat after completion')}</p></div>
+        <div class="routine-symbol">${renderRoutineIcon(routine.icon_name || suggestIconName(routine.title), iconTint, 19)}</div>
+        <div class="routine-title-wrap"><h3 title="${escapeHtml(routine.title)}">${escapeHtml(routine.title)}</h3><p>${escapeHtml(isFrequency ? (routine.linked_to_routine_id ? 'Linked frequency target' : 'Frequency target') : routine.linked_to_routine_id ? 'Linked routine' : 'Repeat after completion')}</p></div>
         <button class="routine-menu" type="button" data-action="edit" data-id="${escapeHtml(routine.id)}" aria-label="Edit ${escapeHtml(routine.title)}" title="Edit">✎</button>
         <button class="routine-menu" type="button" data-action="archive" data-id="${escapeHtml(routine.id)}" aria-label="Archive ${escapeHtml(routine.title)}" title="Archive">×</button>
       </div>
@@ -204,7 +345,6 @@ function routineCard(routine) {
       <div class="routine-card-footer"><span class="routine-status"><i class="status-dot ${statusGood ? 'good' : ''}"></i>${escapeHtml(status)}</span><button class="routine-action" type="button" data-action="complete" data-id="${escapeHtml(routine.id)}" ${!canComplete || completed ? 'disabled' : ''}>${actionLabel} ${completed ? '✓' : '→'}</button></div>
     </article>`;
 }
-
 function renderChecklist() {
   const items = state.routines.filter((r) => r.type === 'frequency' ? r.checkinAvailable : r.isDue)
     .sort((a, b) => (a.type === 'interval' ? 0 : 1) - (b.type === 'interval' ? 0 : 1) || (a.title || '').localeCompare(b.title || ''));
@@ -219,7 +359,9 @@ function renderChecklist() {
       ? `${r.completedCount}/${r.max_count} completed this period${r.minimumReached ? ' · minimum reached' : ` · ${r.remainingMinimum} more for minimum`}`
       : `${dueDescription(r)} · ${r.cadenceLabel}`;
     const label = isFrequency ? 'Check in' : 'Mark done';
-    return `<article class="checklist-card"><div class="check-spot ${escapeHtml(r.color)}">${colorSymbols[r.color] || '✧'}</div><div class="check-info"><strong>${escapeHtml(r.title)}</strong><small>${escapeHtml(info)}</small></div><button class="check-action" data-action="complete" data-id="${escapeHtml(r.id)}">${label} <span>→</span></button></article>`;
+    const accent = resolveColor(r.color);
+    const iconTint = accent;
+    return `<article class="checklist-card" style="--routine-accent:${accent};--routine-icon-color:${iconTint}"><div class="check-spot">${renderRoutineIcon(r.icon_name || suggestIconName(r.title), iconTint, 18)}</div><div class="check-info"><strong>${escapeHtml(r.title)}</strong><small>${escapeHtml(info)}</small></div><button class="check-action" data-action="complete" data-id="${escapeHtml(r.id)}">${label} <span>→</span></button></article>`;
   }).join('');
 }
 
@@ -341,7 +483,7 @@ async function loadHistory() {
 }
 
 async function deleteActivity(id) {
-  if (!confirm('Delete this activity? This will remove it from your history and update routine progress.')) return;
+  if (!confirm('Delete this activity? This will remove it from your history, update routine progress, and delete its matching Google Task if one was synced.')) return;
   try { await api(`/api/history/${encodeURIComponent(id)}`, { method: 'DELETE' }); await loadBootstrap(); await loadHistory(); if (state.activePage === 'calendar') await loadCalendar(); toast('Activity deleted.'); }
   catch (error) { toast(error.message, 'error'); }
 }
@@ -351,10 +493,17 @@ function setSelectedType(type) {
   $$('.type-option').forEach((button) => button.classList.toggle('active', button.dataset.type === type));
   $('#frequencyFields').hidden = type !== 'frequency';
   $('#intervalFields').hidden = type !== 'interval';
+  if ($('#linkedEnabled')) toggleLinkedFields();
 }
 function setSelectedColor(color) {
-  state.selectedColor = color;
-  $$('.color-choice').forEach((button) => button.classList.toggle('selected', button.dataset.color === color));
+  const value = COLOR_HEX[color] ? color : resolveColor(color);
+  state.selectedColor = value;
+  $$('.color-choice').forEach((button) => button.classList.toggle('selected', button.dataset.color === value));
+  const picker = $('#customRoutineColor');
+  if (picker) picker.value = resolveColor(value);
+  state.selectedIconColor = resolveColor(value);
+  renderIconSelection();
+  renderSavedColorOptions();
 }
 function toggleLastDoneFields() {
   const hasLast = $('#hasLastDone').checked;
@@ -363,14 +512,14 @@ function toggleLastDoneFields() {
 }
 function fillLinkedRoutineOptions(routine = null) {
   const select = $('#linkedRoutine');
-  const choices = state.routines.filter((r) => r.type === 'interval' && !r.linked_to_routine_id && !r.archived && r.id !== routine?.id);
-  select.innerHTML = '<option value="">Choose a repeat-after routine</option>' + choices.map((r) => `<option value="${escapeHtml(r.id)}">${escapeHtml(r.title)} · ${escapeHtml(r.cadenceLabel)}</option>`).join('');
+  const choices = state.routines.filter((r) => !r.linked_to_routine_id && !r.archived && r.id !== routine?.id);
+  select.innerHTML = '<option value="">Choose a routine to follow</option>' + choices.map((r) => `<option value="${escapeHtml(r.id)}">${escapeHtml(r.title)} · ${escapeHtml(r.cadenceLabel)}</option>`).join('');
   if (routine?.linked_to_routine_id) select.value = routine.linked_to_routine_id;
 }
 function toggleLinkedFields() {
   const linked = $('#linkedEnabled').checked;
   $('#linkedFields').hidden = !linked;
-  $('#intervalRegularFields').hidden = linked;
+  $('#intervalRegularFields').hidden = state.selectedType === 'interval' && linked;
 }
 function openRoutineModal(routine = null) {
   $('#routineForm').reset();
@@ -381,12 +530,17 @@ function openRoutineModal(routine = null) {
   const type = routine?.type || 'frequency';
   setSelectedType(type);
   setSelectedColor(routine?.color || 'lavender');
-  const today = formatDateText(localDateInput());
+  state.selectedIconName = routine?.icon_name && routine.icon_name !== 'sparkles' ? routine.icon_name : suggestIconName(routine?.title || '');
+  state.iconManuallySelected = Boolean(routine?.icon_name && routine.icon_name !== 'sparkles');
+  state.selectedIconColor = resolveColor(state.selectedColor);
+  $('#customRoutineColor').value = resolveColor(state.selectedColor);
   $('#minCount').value = routine?.min_count ?? 2;
   $('#maxCount').value = routine?.max_count ?? 3;
   $('#periodValue').value = routine?.period_value ?? 1;
   $('#periodUnit').value = routine?.period_unit || 'weeks';
-  $('#progressive').checked = routine?.progressive !== false && routine?.progressive !== 0;
+  const progressiveValue = routine?.progressive;
+  $('#progressive').checked = routine ? (progressiveValue === true || progressiveValue === 1 || progressiveValue === '1') : true;
+  const today = formatDateText(localDateInput());
   $('#startAt').value = routine?.start_at ? formatDateText(dateKey(routine.start_at)) : today;
   $('#intervalValue').value = routine?.interval_value ?? 2;
   $('#intervalUnit').value = routine?.interval_unit || 'weeks';
@@ -401,12 +555,14 @@ function openRoutineModal(routine = null) {
   $('#linkedDays').value = Math.abs(offset);
   toggleLinkedFields();
   toggleLastDoneFields();
+  $('#iconSearch').value = '';
+  renderSavedColorOptions();
+  renderIconSelection();
   $$('.type-option').forEach((button) => { button.disabled = Boolean(routine); button.style.opacity = routine ? '.65' : '1'; });
   $('#routineModal').hidden = false;
   document.body.style.overflow = 'hidden';
   setTimeout(() => $('#routineTitle').focus(), 40);
 }
-
 function closeRoutineModal() {
   $('#routineModal').hidden = true;
   document.body.style.overflow = '';
@@ -418,18 +574,18 @@ async function saveRoutine(event) {
   const id = $('#routineId').value;
   const title = $('#routineTitle').value.trim();
   if (!title) return toast('Give your routine a name first.', 'error');
-  let body = { title, notes: $('#routineNotes').value, color: state.selectedColor, type: state.selectedType };
+  const linked = $('#linkedEnabled').checked;
+  const linkedToRoutineId = linked ? $('#linkedRoutine').value : null;
+  const linkedOffsetDays = ($('#linkedDirection').value === 'before' ? -1 : 1) * Number($('#linkedDays').value || 0);
+  if (linked && !linkedToRoutineId) return toast('Choose the routine this task should follow.', 'error');
+  let body = { title, notes: $('#routineNotes').value, color: state.selectedColor, iconName: state.selectedIconName, iconColor: resolveColor(state.selectedColor), type: state.selectedType, linkedToRoutineId, linkedOffsetDays };
   if (state.selectedType === 'frequency') {
     const startAt = dateInputToIso($('#startAt').value);
     if (!startAt) return toast('Enter the start date as DD-MM-YYYY or choose it from the calendar.', 'error');
     body = { ...body, minCount: Number($('#minCount').value), maxCount: Number($('#maxCount').value), progressive: $('#progressive').checked,
       periodValue: Number($('#periodValue').value), periodUnit: $('#periodUnit').value, startAt };
   } else {
-    const linked = $('#linkedEnabled').checked;
-    body = { ...body, intervalValue: Number($('#intervalValue').value), intervalUnit: $('#intervalUnit').value,
-      linkedToRoutineId: linked ? $('#linkedRoutine').value : null,
-      linkedOffsetDays: ( $('#linkedDirection').value === 'before' ? -1 : 1) * Number($('#linkedDays').value || 0) };
-    if (linked && !body.linkedToRoutineId) return toast('Choose the routine this task should follow.', 'error');
+    body = { ...body, intervalValue: Number($('#intervalValue').value), intervalUnit: $('#intervalUnit').value };
     if (!linked && $('#hasLastDone').checked) {
       const lastCompletedAt = dateInputToIso($('#lastCompletedAt').value);
       if (!lastCompletedAt) return toast('Enter the last-completed date as DD-MM-YYYY.', 'error');
@@ -437,6 +593,7 @@ async function saveRoutine(event) {
     } else if (!linked) {
       const nextDueAt = dateInputToIso($('#firstDueAt').value);
       if (!nextDueAt) return toast('Enter the first due date as DD-MM-YYYY.', 'error');
+      body.lastCompletedAt = null;
       body.nextDueAt = nextDueAt;
     }
   }
@@ -670,6 +827,28 @@ function installHandlers() {
   $('#routineForm').addEventListener('submit', saveRoutine);
   $$('.type-option').forEach((button) => button.addEventListener('click', () => setSelectedType(button.dataset.type)));
   $$('.color-choice').forEach((button) => button.addEventListener('click', () => setSelectedColor(button.dataset.color)));
+  $('#customRoutineColor').addEventListener('input', (event) => setSelectedColor(event.target.value));
+  $('#saveRoutineColor').addEventListener('click', () => saveColorToBrowser(state.selectedColor));
+  $('#savedColorOptions').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-saved-color]');
+    if (button) setSelectedColor(button.dataset.savedColor);
+  });
+  $('#iconSearch').addEventListener('input', renderIconGrid);
+  $('#iconGrid').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-icon-name]');
+    if (button) selectRoutineIcon(button.dataset.iconName, true);
+  });
+  $('#useSuggestedIcon').addEventListener('click', () => selectRoutineIcon(suggestIconName($('#routineTitle').value), false));
+  $('#routineTitle').addEventListener('input', () => {
+    if (!state.iconManuallySelected) {
+      state.selectedIconName = suggestIconName($('#routineTitle').value);
+      renderIconSelection();
+    } else {
+      const suggestion = ICON_BY_NAME[suggestIconName($('#routineTitle').value)] || ICON_BY_NAME.sparkles;
+      $('#iconSuggestionLabel').textContent = `Suggested: ${suggestion.label}`;
+      $('#useSuggestedIcon').hidden = state.selectedIconName === suggestion.name;
+    }
+  });
   $('#hasLastDone').addEventListener('change', toggleLastDoneFields);
   $('#linkedEnabled').addEventListener('change', toggleLinkedFields);
   $('#calendarPrev').addEventListener('click', () => { state.calendarMonth.setMonth(state.calendarMonth.getMonth() - 1); loadCalendar(); });

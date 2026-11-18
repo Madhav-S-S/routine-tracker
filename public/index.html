@@ -36,6 +36,10 @@
     <main class="main-content">
       <header class="topbar">
         <button class="icon-button mobile-menu" id="mobileMenuButton" aria-label="Open navigation menu" aria-controls="sidebar" aria-expanded="false">☰</button>
+        <a class="brand mobile-topbar-brand" href="#dashboard" aria-label="Routine home">
+          <span class="brand-mark"><span></span><span></span><span></span></span>
+          <span class="brand-name">routine<span class="brand-period">.</span></span>
+        </a>
         <button class="mobile-profile-button" id="mobileProfileButton" type="button" aria-label="Open profile settings">
           <span class="top-avatar" id="mobileHeaderAvatar">Y</span>
         </button>
@@ -151,16 +155,6 @@
         </div>
 
         <div id="intervalFields" class="rule-fields" hidden>
-          <label class="check-line link-routine-toggle"><input type="checkbox" id="linkedEnabled"><span><strong>Linked routine</strong><small>Schedule this routine in relation to another routine.</small></span></label>
-          <div id="linkedFields" class="linked-fields" hidden>
-            <label class="field-label" for="linkedRoutine">Link to routine</label>
-            <select class="text-input" id="linkedRoutine"><option value="">Choose a repeat-after routine</option></select>
-            <div class="inline-fields linked-offset-row">
-              <div><label for="linkedDirection">Schedule</label><select class="text-input" id="linkedDirection"><option value="before">Before</option><option value="after">After</option></select></div>
-              <div><label for="linkedDays">Number of days</label><input class="text-input" type="number" id="linkedDays" min="0" max="3650" value="1"></div>
-            </div>
-            <div class="field-hint">Example: use rosemary water 1 day before your Bath routine is due. When Bath is completed, the linked date moves with its next schedule.</div>
-          </div>
           <div id="intervalRegularFields">
             <div class="field-label">Repeat after</div>
             <div class="inline-fields period-fields"><div><label for="intervalValue">Every</label><input class="text-input" type="number" id="intervalValue" min="1" max="3650" value="2"></div><div><label for="intervalUnit">Period</label><select class="text-input" id="intervalUnit"><option value="weeks">Week(s)</option><option value="days">Day(s)</option><option value="months">Month(s)</option><option value="years">Year(s)</option></select></div></div>
@@ -171,7 +165,40 @@
           </div>
         </div>
 
-        <div class="field-label color-field-label">Choose a mood</div><div class="color-options" id="colorOptions"><button type="button" class="color-choice lavender selected" data-color="lavender" aria-label="Lavender"></button><button type="button" class="color-choice mint" data-color="mint" aria-label="Mint"></button><button type="button" class="color-choice peach" data-color="peach" aria-label="Peach"></button><button type="button" class="color-choice blue" data-color="blue" aria-label="Blue"></button><button type="button" class="color-choice rose" data-color="rose" aria-label="Rose"></button><button type="button" class="color-choice gold" data-color="gold" aria-label="Gold"></button></div>
+        <section class="linked-routine-panel">
+          <label class="check-line link-routine-toggle"><input type="checkbox" id="linkedEnabled"><span><strong>Linked routine</strong><small>Schedule this routine relative to another routine. Works with frequency and repeat-after routines.</small></span></label>
+          <div id="linkedFields" class="linked-fields" hidden>
+            <label class="field-label" for="linkedRoutine">Link to routine</label>
+            <select class="text-input" id="linkedRoutine"><option value="">Choose a routine to follow</option></select>
+            <div class="inline-fields linked-offset-row">
+              <div><label for="linkedDirection">Schedule</label><select class="text-input" id="linkedDirection"><option value="before">Before</option><option value="after">After</option></select></div>
+              <div><label for="linkedDays">Number of days</label><input class="text-input" type="number" id="linkedDays" min="0" max="3650" value="1"></div>
+            </div>
+            <div class="field-hint">Example: rosemary water 1 day before Bath. When Bath's next occurrence changes, this date moves with it. For a frequency parent, its next Progressive check-in is the anchor. A linked frequency child still follows its own frequency spacing once that date arrives.</div>
+          </div>
+        </section>
+
+        <div class="routine-customization">
+          <section class="customization-section">
+            <div class="field-label color-field-label">Routine color</div>
+            <div class="color-options" id="colorOptions">
+              <button type="button" class="color-choice lavender selected" data-color="lavender" aria-label="Lavender" title="Lavender"></button>
+              <button type="button" class="color-choice mint" data-color="mint" aria-label="Mint" title="Mint"></button>
+              <button type="button" class="color-choice peach" data-color="peach" aria-label="Peach" title="Peach"></button>
+              <button type="button" class="color-choice blue" data-color="blue" aria-label="Blue" title="Blue"></button>
+              <button type="button" class="color-choice rose" data-color="rose" aria-label="Rose" title="Rose"></button>
+              <button type="button" class="color-choice gold" data-color="gold" aria-label="Gold" title="Gold"></button>
+              <label class="custom-color-choice" title="Choose a custom color"><input type="color" id="customRoutineColor" value="#a895f0" aria-label="Choose custom routine color"><span>＋</span></label>
+            </div>
+            <div class="saved-colors-row"><button type="button" class="save-color-button" id="saveRoutineColor">Save this color</button><div class="saved-color-options" id="savedColorOptions"><small class="saved-colors-empty">Saved colors stay in this browser.</small></div></div>
+          </section>
+          <section class="customization-section icon-customization-section">
+            <div class="icon-picker-heading"><div class="icon-selected-preview" id="selectedIconPreview"></div><div class="icon-suggestion-copy"><strong id="iconSuggestionLabel">Suggested: Sparkles</strong><small>Icon inherits your routine color · suggested from its name</small></div><button type="button" class="use-suggested-icon" id="useSuggestedIcon">Use suggestion</button></div>
+            <label class="field-label" for="iconSearch">Choose an icon <span>SEARCH 60+ MINIMAL ICONS</span></label>
+            <input class="text-input icon-search-input" id="iconSearch" type="search" placeholder="Search leaf, water, bath, book..." autocomplete="off">
+            <div class="icon-grid" id="iconGrid" aria-label="Routine icons"></div>
+          </section>
+        </div>
         <div class="modal-footer"><button type="button" class="secondary-button" id="cancelRoutineButton">Cancel</button><button type="submit" class="primary-button" id="saveRoutineButton">Save routine <span>→</span></button></div>
       </form>
     </div>
