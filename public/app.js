@@ -599,7 +599,10 @@ function renderCalendarGrid() {
     const visible = events.slice(0, visibleLimit);
     const more = events.length - visible.length;
     const eventMarkup = visible.map((event) => `<button type="button" class="calendar-event ${escapeHtml(event.kind)}" data-calendar-event="${escapeHtml(event.id)}" title="Open ${escapeHtml(event.title)}">${escapeHtml(event.title)}</button>`).join('');
-    cells.push(`<div data-calendar-date="${key}" class="calendar-day ${day.getMonth() !== state.calendarMonth.getMonth() ? 'outside' : ''} ${key === todayKey ? 'today' : ''} ${state.selectedCalendarDate === key ? 'selected' : ''}"><button type="button" class="day-number day-select" data-calendar-date="${key}" aria-label="Show ${events.length} tasks and events for ${escapeHtml(formatLongDate(day))}" aria-pressed="${state.selectedCalendarDate === key}">${day.getDate()}</button>${eventMarkup}${more > 0 ? `<div class="calendar-more">+${more} more · select date</div>` : events.length ? '<div class="calendar-day-hint">Select date for details</div>' : ''}</div>`);
+    const overflowBadge = more > 0
+      ? `<span class="calendar-overflow-count" aria-label="${more} additional tasks or events">+${more}</span>`
+      : '';
+    cells.push(`<div data-calendar-date="${key}" class="calendar-day ${day.getMonth() !== state.calendarMonth.getMonth() ? 'outside' : ''} ${key === todayKey ? 'today' : ''} ${state.selectedCalendarDate === key ? 'selected' : ''}"><button type="button" class="day-number day-select" data-calendar-date="${key}" aria-label="Show ${events.length} tasks and events for ${escapeHtml(formatLongDate(day))}" aria-pressed="${state.selectedCalendarDate === key}">${day.getDate()}</button>${overflowBadge}${eventMarkup}</div>`);
   }
   $('#calendarGrid').innerHTML = cells.join('');
   renderCalendarDayDetails();
