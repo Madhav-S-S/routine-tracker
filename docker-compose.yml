@@ -7,9 +7,9 @@ services:
       - .env
     environment:
       NODE_ENV: production
-      PORT: 3000
+      PORT: 4317
       DATABASE_PATH: /app/data/routine-tracker.sqlite
     ports:
-      - "3000:3000"
+      - "4317:4317"
     volumes:
       - ./data:/app/data

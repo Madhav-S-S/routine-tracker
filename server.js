@@ -13,7 +13,7 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const { google } = require('googleapis');
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = Number(process.env.PORT || 4317);
 const BASE_URL = (process.env.BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `${BASE_URL}/auth/google/callback`;
 const DB_PATH = path.resolve(process.env.DATABASE_PATH || './data/routine-tracker.sqlite');
@@ -140,7 +140,21 @@ function toIso(value, fallback = null) {
 function addInterval(dateLike, amount, unit) {
   const date = new Date(dateLike);
   const n = Number(amount);
-  if (!Number.isFinite(n) || n < 1) throw new Error('Interval must be at least one unit.');
+
+  // Zero is valid as an internal date offset. getCurrentPeriod() uses it
+  // for the first period boundary. Actual routine intervals are validated
+  // separately and must still be at least one unit.
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error('Date offset cannot be negative.');
+  }
+  if (!Number.isInteger(n)) {
+    throw new Error('Date offset must be a whole number.');
+  }
+  if (Number.isNaN(date.getTime())) {
+    throw new Error('A valid date is required.');
+  }
+  if (n === 0) return date;
+
   if (unit === 'days') date.setUTCDate(date.getUTCDate() + n);
   else if (unit === 'weeks') date.setUTCDate(date.getUTCDate() + (7 * n));
   else if (unit === 'months') {
@@ -157,7 +171,9 @@ function addInterval(dateLike, amount, unit) {
     date.setUTCMonth(originalMonth);
     const lastDay = new Date(Date.UTC(date.getUTCFullYear(), originalMonth + 1, 0)).getUTCDate();
     date.setUTCDate(Math.min(originalDay, lastDay));
-  } else throw new Error('Unsupported time unit.');
+  } else {
+    throw new Error('Unsupported time unit.');
+  }
   return date;
 }
 function getCurrentPeriod(routine, now = new Date()) {

@@ -89,3 +89,180 @@ h1 em { color: #8571c9; font-style: normal; font-weight: 500; }
 @media (max-width: 900px) { .sidebar { width: 220px; }.main-content { margin-left: 220px; padding: 0 24px 22px; }.stats-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }.hero-art { right: -50px; opacity: .72; }.settings-layout { grid-template-columns: 1fr; }.settings-aside { display: grid; grid-template-columns: 1fr 1fr; }.calendar-day { min-height: 90px; } }
 @media (max-width: 680px) { .sidebar { transform: translateX(-100%); transition: transform .25s ease; box-shadow: 15px 0 45px rgba(30,25,48,.08); }.sidebar.open { transform: translateX(0); }.main-content { margin-left: 0; padding: 0 17px 20px; }.topbar { height: 62px; margin-bottom: 25px; }.mobile-menu { display: grid !important; }.sync-indicator { display: none; }.welcome-row, .page-heading-row { align-items: flex-start; flex-direction: column; gap: 14px; }.welcome-row .primary-button, .page-heading-row .primary-button { align-self: flex-start; }.welcome-row h1 { font-size: 30px; }.hero-panel { min-height: 255px; padding: 25px 24px 25px; }.hero-panel-copy { max-width: 72%; }.hero-panel h2 { font-size: 25px; }.hero-panel p { max-width: 230px; }.hero-art { right: -165px; opacity: .5; transform: scale(.78); }.hero-bottom-line { left: 24px; right: 24px; }.stats-grid { gap: 9px; margin-bottom: 29px; }.stat-card { min-height: 105px; padding: 13px; }.stat-value { font-size: 23px; }.checklist-list { grid-template-columns: 1fr; }.routine-grid, .all-routines-grid { grid-template-columns: 1fr; }.section-heading-row { align-items: center; }.section-heading-row h2 { font-size: 19px; }.calendar-toolbar { flex-direction: column; align-items: flex-start; gap: 12px; }.calendar-legend { flex-wrap: wrap; gap: 10px; }.calendar-card { padding: 0 7px 10px; }.calendar-day { min-height: 76px; padding: 5px 3px; }.calendar-weekdays { min-height: 37px; font-size: 7px; }.day-number { width: 20px; height: 20px; font-size: 9px; }.calendar-event { font-size: 7px; padding: 3px 3px; }.calendar-more { font-size: 7px; }.settings-aside { grid-template-columns: 1fr; }.filter-row { align-items: flex-start; flex-direction: column; gap: 12px; }.history-card { padding: 18px 15px; }.app-footer { margin-top: 30px; }.app-footer > span:last-child { display: none; }.routine-modal { padding: 21px 17px 17px; }.modal-backdrop { padding: 10px; }.type-option { padding: 9px 8px; }.type-option strong { font-size: 9px; }.type-option small { font-size: 7px; }.toast-region { left: 12px; right: 12px; bottom: 12px; }.toast { max-width: none; } }
 @media (prefers-reduced-motion: reduce) { *, *:before, *:after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }
+
+/* Routine Tracker — default dark appearance.
+   Load this file AFTER styles.css in index.html. */
+:root {
+  color-scheme: dark;
+  --ink: #eeeaf7;
+  --muted: #aaa5bd;
+  --soft: #8f8aa4;
+  --line: #343044;
+  --paper: #171621;
+  --surface: #211f2d;
+  --purple: #a895f0;
+  --purple-dark: #8d78df;
+  --purple-pale: #302943;
+  --green: #79c7a6;
+  --orange: #e5a779;
+  --shadow: 0 16px 42px rgba(0, 0, 0, .24);
+}
+
+html { background: #14131c; color-scheme: dark; }
+body { color: var(--ink); background: #14131c; }
+::selection { color: #fff; background: #6e5ab4; }
+
+/* Persistent frame */
+.sidebar {
+  background: #1a1825;
+  border-right-color: #302c40;
+  box-shadow: 8px 0 30px rgba(0, 0, 0, .12);
+}
+.brand-mark { background: #302943; }
+.workspace-label, .sidebar-section-heading, .eyebrow { color: #928ba8; }
+.nav-item { color: #aaa5bd; }
+.nav-item:hover { background: #282538; color: #eee9fb; }
+.nav-item.active { color: #c2b5ff; background: #302943; }
+.nav-count { background: #302c40; color: #b5aecb; }
+.sidebar-divider, .profile-mini { border-color: #302c40; }
+.sidebar-divider { background: #302c40; }
+.sidebar-tip { background: linear-gradient(145deg, #29243a, #211f2e); }
+.sidebar-tip:after { border-color: #51466f; box-shadow: 0 0 0 11px rgba(122, 102, 174, .10), 0 0 0 23px rgba(122, 102, 174, .06); }
+.tip-orbit { border-color: #51466f; color: #b8a8f5; }
+.tip-title { color: #e5def8; }
+.sidebar-tip p { color: #aaa3bd; }
+.avatar, .top-avatar { background: #352e4d; color: #d0c4ff; }
+.top-avatar { border-color: #1a1825; box-shadow: 0 0 0 1px #403951; }
+.profile-copy strong { color: #e8e3f3; }
+.profile-copy small, .profile-more { color: #918ba3; }
+
+.main-content { color: var(--ink); }
+.topbar { border-bottom-color: #302c40; }
+.breadcrumb { color: #918ba3; }
+.breadcrumb strong { color: #e3dff0; }
+.crumb-slash { color: #5e5870; }
+.sync-indicator { color: #aaa4bb; }
+h1, .section-heading-row h2, .calendar-month-title h2,
+.history-card-header h2, .settings-card-top h2 { color: #eeeaf7; }
+h1 em { color: #b5a4ff; }
+.page-subtitle { color: #aaa4bb; }
+
+/* Dashboard cards and routine cards */
+.stat-card, .checklist-card, .routine-card, .calendar-card,
+.history-card, .settings-card, .local-data-note {
+  background: #211f2d;
+  border-color: #343044;
+  box-shadow: 0 5px 18px rgba(0, 0, 0, .13);
+}
+.stat-top { color: #aaa4bb; }
+.stat-value { color: #f0ecf8; }
+.stat-foot, .check-info small, .routine-title-wrap p,
+.routine-card-footer, .routine-meta { color: #a39db5; }
+.check-info strong, .routine-title-wrap h3,
+.history-entry-copy strong, .settings-card-top h2,
+.local-data-note strong { color: #e9e4f3; }
+.checklist-card:hover, .routine-card:hover { border-color: #51466c; }
+.check-action { background: #2c273d; border-color: #49405f; color: #c0b1ff; }
+.check-action.done { background: #20372f; border-color: #315846; color: #91d4b5; }
+.checklist-empty, .routine-grid-empty {
+  background: rgba(35, 32, 48, .72);
+  border-color: #49425b;
+  color: #aaa4bb;
+}
+.checklist-empty strong, .routine-grid-empty strong { color: #e8e2f2; }
+.empty-check-icon { background: #302943; color: #c1b2ff; }
+.heading-count, .filter-pill.active { background: #302943; border-color: #51446e; color: #c4b6ff; }
+.filter-pill { color: #aaa4bb; }
+.filter-pill:hover { background: #282538; color: #eee9fb; }
+.result-count { color: #928ba5; }
+.routine-meta strong { color: #d6cfee; }
+.progress-track { background: #393447; }
+.routine-menu { color: #a39db3; }
+.routine-action { color: #b9a8ff; }
+.bottom-note { color: #928ba5; }
+.note-line { background: #393447; }
+
+/* Calendar */
+.icon-button { background: #282536; border-color: #403a52; color: #b7afca; }
+.icon-button:hover { background: #332d47; border-color: #66578e; color: #d3c8ff; }
+.calendar-legend { color: #aaa4bb; }
+.calendar-weekdays { color: #a19ab3; border-bottom-color: #393447; }
+.calendar-day { border-right-color: #343044; border-bottom-color: #343044; }
+.calendar-day.outside { background: #1b1926; color: #656075; }
+.day-number { color: #d0cadf; }
+.calendar-event { background: #3a2b25; color: #f0b98f; }
+.calendar-event.completion { background: #20372f; color: #91d4b5; }
+.calendar-event.google { background: #26334b; color: #adc3f0; }
+.calendar-event.target { background: #302943; color: #c7b8ff; }
+.calendar-footnote, .calendar-empty, .calendar-more { color: #958ea6; }
+
+/* History and Google connection settings */
+.history-card-header { border-bottom-color: #393447; }
+.history-card-header p, .history-entry-copy small,
+.history-date, .history-empty { color: #a39db4; }
+.history-entry { border-bottom-color: #343044; }
+.history-mark { background: #20372f; color: #91d4b5; }
+.settings-explainer { background: #292638; color: #b0a9c1; }
+.connection-status, .small-status { background: #302c3e; color: #b1a9c2; }
+.connection-status.connected, .small-status.ready { background: #20372f; color: #91d4b5; }
+.secondary-button { background: #292638; border-color: #49425a; color: #d0c9e0; }
+.secondary-button:hover { background: #353047; border-color: #65578e; color: #e6ddff; }
+.drive-file-row { border-color: #3a344a; background: #1d1b29; }
+.drive-file-row strong { color: #e5e0ef; }
+.drive-file-row small, .connected-account small,
+.settings-card-top p, .settings-hint, .calendar-sync-info,
+.local-data-note p { color: #a39db4; }
+.file-mark { background: #20372f; color: #91d4b5; }
+.local-data-note code { background: #302943; color: #c7b8ff; }
+
+/* Create/edit routine modal and form controls */
+.modal-backdrop { background: rgba(5, 4, 10, .76); }
+.routine-modal {
+  color: #eeeaf7;
+  background: #211f2d;
+  border: 1px solid #39334b;
+  box-shadow: 0 24px 90px rgba(0, 0, 0, .55);
+}
+.modal-header h2 { color: #f0ecf8; }
+.modal-header p { color: #a49db7; }
+.modal-close { background: #302c40; color: #c0b8d0; }
+.modal-close:hover { background: #3b3450; color: #fff; }
+.field-label { color: #d4cde4; }
+.field-label > span { color: #9b93ad; }
+.text-input {
+  color: #eeeaf7;
+  background: #191824;
+  border-color: #3b354d;
+  color-scheme: dark;
+}
+.text-input:focus { border-color: #8c78dc; box-shadow: 0 0 0 3px rgba(140, 120, 220, .16); }
+.text-input::placeholder { color: #777188; }
+.inline-fields label, .field-hint, .range-dash { color: #a39bb5; }
+.type-option { background: #211f2d; border-color: #3b354d; color: #b9b1c9; }
+.type-option strong { color: #e0daed; }
+.type-option small { color: #a39bb5; }
+.type-option > span { background: #302943; color: #c0b0ff; }
+.type-option.active { background: #302943; border-color: #8c78dc; box-shadow: 0 0 0 2px rgba(140, 120, 220, .12); }
+.rule-fields { background: #191824; border-color: #39334b; }
+.check-line { color: #c1b9d0; }
+.modal-footer { border-top-color: #39334b; }
+.color-choice { border-color: #211f2d; }
+.color-choice.selected { outline-color: #c4b5ff; }
+
+/* Keep the decorative panels colourful while the rest of the app stays dark. */
+.hero-panel, .privacy-card { color: #fff; }
+.toast { background: #353047; color: #fff; }
+.toast.error { background: #914d59; }
+.toast.success { background: #356e5b; }
+
+/* Native browser controls and scrollbars */
+input, textarea, select, button { color-scheme: dark; }
+input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(.82); opacity: .8; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #171621; }
+::-webkit-scrollbar-thumb { background: #454057; border: 2px solid #171621; border-radius: 20px; }
+::-webkit-scrollbar-thumb:hover { background: #645a7c; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; }
+}

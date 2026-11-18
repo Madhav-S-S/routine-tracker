@@ -1,6 +1,6 @@
 {
   "name": "routine-tracker",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "A server-based routine tracker with server-side Google OAuth, Drive backups and Calendar sync.",
   "main": "server.js",

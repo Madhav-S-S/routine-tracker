@@ -76,7 +76,17 @@ You need Node.js 20 or newer and npm.
    npm start
    ```
 
-8. Open [http://localhost:3000](http://localhost:3000).
+8. Open [http://localhost:4317](http://localhost:4317).
+
+**Port note (Windows):** this version uses port `4317` by default to avoid the common `3000` conflict. When upgrading an existing installation, edit your existing `.env` file (not just `.env.example`) and set these three lines to the same port:
+
+   ```dotenv
+   PORT=4317
+   BASE_URL=http://localhost:4317
+   GOOGLE_REDIRECT_URI=http://localhost:4317/auth/google/callback
+   ```
+
+   Also add `http://localhost:4317/auth/google/callback` under **Authorized redirect URIs** in your Google OAuth client. Then stop the old Node process and run `npm start` again.
 
 Your routine data is stored in `data/routine-tracker.sqlite`. Keep that file to retain your routines and completion history.
 
@@ -92,7 +102,7 @@ You need a Google Cloud project and a Web application OAuth client.
 6. Add this exact Authorized redirect URI:
 
    ```text
-   http://localhost:3000/auth/google/callback
+   http://localhost:4317/auth/google/callback
    ```
 
 7. Copy the Client ID and Client Secret into `.env`:
@@ -100,8 +110,8 @@ You need a Google Cloud project and a Web application OAuth client.
    ```dotenv
    GOOGLE_CLIENT_ID=...apps.googleusercontent.com
    GOOGLE_CLIENT_SECRET=...
-   GOOGLE_REDIRECT_URI=http://localhost:3000/auth/google/callback
-   BASE_URL=http://localhost:3000
+   GOOGLE_REDIRECT_URI=http://localhost:4317/auth/google/callback
+   BASE_URL=http://localhost:4317
    COOKIE_SECURE=false
    ```
 
@@ -139,7 +149,7 @@ A straightforward OCI deployment is:
    ```
 
 6. Add the matching HTTPS redirect URI to your Google OAuth client in Cloud Console.
-7. Configure a reverse proxy such as Caddy or Nginx to terminate HTTPS and forward traffic to port 3000. `Caddyfile.example` is included as a starting point.
+7. Configure a reverse proxy such as Caddy or Nginx to terminate HTTPS and forward traffic to port 4317. `Caddyfile.example` is included as a starting point.
 8. Ensure the data directory is on the persistent volume. Either run the compose project from the mounted volume or change the `./data:/app/data` mapping in `docker-compose.yml` to the actual host path. Ensure the mounted data folder is writable by the container user (UID 1000), for example with `sudo chown -R 1000:1000 /srv/routine-tracker/data`.
 9. Build and start:
 
