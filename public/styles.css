@@ -1519,3 +1519,55 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .calendar-day { min-height: 104px; }
   .calendar-event { min-height: 13px; margin-top: 2px; padding: 1px 3px; font-size: 6.5px; line-height: 1.2; }
 }
+
+
+/* Brand signature: routine. by Madhav */
+.brand-copy {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  min-width: 0;
+  gap: 2px;
+  line-height: 1;
+}
+.brand-copy .brand-name {
+  display: block;
+  line-height: 1;
+}
+.brand-byline {
+  display: block;
+  margin: 0 0 0 1px;
+  color: #91a087;
+  font: 600 8px/1.1 'DM Sans', sans-serif;
+  letter-spacing: .55px;
+  white-space: nowrap;
+}
+
+@media (max-width: 680px) {
+  .mobile-topbar-brand {
+    align-items: center;
+    gap: 7px !important;
+  }
+  .mobile-topbar-brand .brand-copy {
+    gap: 3px;
+  }
+  .mobile-topbar-brand .brand-byline {
+    margin-left: 1px;
+    color: #aab6a5;
+    font-size: 7.5px;
+    letter-spacing: .6px;
+  }
+  .topbar .breadcrumb {
+    align-items: center;
+    gap: 9px;
+  }
+  .topbar .breadcrumb::before {
+    font-size: 24px !important;
+    font-weight: 400 !important;
+    line-height: .85 !important;
+    color: #d7f36a !important;
+    opacity: .95;
+    transform: translateY(-1px);
+  }
+}
