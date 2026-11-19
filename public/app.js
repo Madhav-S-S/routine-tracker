@@ -26,6 +26,7 @@ const state = {
 let bootstrapLoadPromise = null;
 let historyLoadPromise = null;
 const calendarLoadPromises = new Map();
+let calendarManualTaskRefreshTimer = null;
 let foregroundRefreshRunning = false;
 let lastForegroundRefreshAt = 0;
 
@@ -531,13 +532,21 @@ function loadCalendar() {
       if (currentMonth !== month) return data;
       state.calendarEvents = data.events || [];
       state.calendarWarning = data.syncWarning;
+      const externalTaskSyncAge = Date.now() - (Date.parse(data.googleTasksLastSync || '') || 0);
+      if (state.google.connected && externalTaskSyncAge > 30000 && !calendarManualTaskRefreshTimer) {
+        calendarManualTaskRefreshTimer = window.setTimeout(() => {
+          calendarManualTaskRefreshTimer = null;
+          const visibleMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
+          if (state.activePage === 'calendar' && visibleMonth === month) loadCalendar();
+        }, 5000);
+      }
       if (state.selectedCalendarDate && !state.selectedCalendarDate.startsWith(month)) state.selectedCalendarDate = null;
       renderCalendarGrid();
       $('#calendarFootnote').textContent = data.syncWarning
         ? `Calendar sync needs attention: ${data.syncWarning}`
         : state.google.connected
           ? `Google Calendar refreshed ${timeAgo(data.googleLastSync)}. Your routine dates are shown here, too.`
-          : 'Connect Google in Settings to display your primary Google Calendar events here.';
+          : 'Connect Google in Settings to display your Google Calendar events and dated Google Tasks here.';
       return data;
     } catch (error) {
       const currentMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
@@ -556,7 +565,7 @@ function calendarEventsForDate(key) {
     .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
 }
 function calendarKindLabel(event) {
-  return ({ google: 'Google event', completion: 'Completed', due: 'Routine due', frequency: 'Frequency task' })[event.kind] || 'Calendar item';
+  return ({ google: 'Google event', 'google-task': event.status === 'completed' ? 'Google Task · Completed' : 'Google Task', completion: 'Completed', due: 'Routine due', frequency: 'Frequency task' })[event.kind] || 'Calendar item';
 }
 function calendarTimeLabel(event) {
   if (event.allDay) return 'All day';
@@ -567,6 +576,10 @@ function calendarTimeLabel(event) {
 function calendarEventDetailText(event) {
   if (event.kind === 'google') {
     return [event.description, event.location ? `Location: ${event.location}` : ''].filter(Boolean).join(' · ') || 'Google Calendar event';
+  }
+  if (event.kind === 'google-task') {
+    return [event.taskListTitle ? `List: ${event.taskListTitle}` : '', event.description || '', event.status === 'completed' ? 'Completed in Google Tasks' : 'Added in Google Tasks']
+      .filter(Boolean).join(' · ');
   }
   if (event.kind === 'completion') return event.note || 'Routine marked complete';
   const routine = state.routines.find((item) => item.id === event.routineId);
@@ -603,7 +616,7 @@ function renderCalendarDayDetails() {
       const canEditDate = Boolean(isCompletion || (event.kind === 'due' && !event.linked));
       const canDelete = Boolean(isCompletion || isRoutineTask);
       const canComplete = Boolean(isRoutineTask && event.available !== false);
-      const googleLink = event.kind === 'google' && event.url
+      const googleLink = ['google', 'google-task'].includes(event.kind) && event.url
         ? `<a class="calendar-day-open-link" href="${escapeHtml(event.url)}" target="_blank" rel="noopener">Open in Google ↗</a>` : '';
       const dateControl = canEditDate
         ? `<label class="calendar-day-date-control"><span>${isCompletion ? 'Completed' : 'Due date'}</span><input type="date" value="${escapeHtml(eventDate)}" data-calendar-day-date="${eventId}" aria-label="Edit ${isCompletion ? 'completion' : 'due'} date for ${escapeHtml(event.title)}"></label>`
@@ -702,10 +715,10 @@ function renderCalendarGrid() {
     const day = new Date(gridStart.getFullYear(), gridStart.getMonth(), gridStart.getDate() + i);
     const key = localDateInput(day);
     const events = (grouped.get(key) || []).sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
-    const visibleLimit = window.matchMedia('(max-width: 680px)').matches ? 2 : 4;
+    const visibleLimit = 4;
     const visible = events.slice(0, visibleLimit);
     const more = events.length - visible.length;
-    const eventMarkup = visible.map((event) => `<button type="button" class="calendar-event ${escapeHtml(event.kind)}" data-calendar-event="${escapeHtml(event.id)}" title="Open ${escapeHtml(event.title)}">${escapeHtml(event.title)}</button>`).join('');
+    const eventMarkup = visible.map((event) => `<button type="button" class="calendar-event ${escapeHtml(event.kind)} ${event.kind === 'google-task' ? 'google' : ''}" data-calendar-event="${escapeHtml(event.id)}" title="Open ${escapeHtml(event.title)}">${escapeHtml(event.title)}</button>`).join('');
     const overflowBadge = more > 0
       ? `<span class="calendar-overflow-count" aria-label="${more} additional tasks or events">+${more}</span>`
       : '';
@@ -895,9 +908,15 @@ function openCalendarEvent(event) {
   state.selectedCalendarEvent = event;
   $('#calendarEventTitle').textContent = event.title;
   const isCompletion = event.kind === 'completion';
-  const isGoogle = event.kind === 'google';
+  const isGoogle = event.kind === 'google' || event.kind === 'google-task';
   const isDue = event.kind === 'due' || event.kind === 'frequency';
-  $('#calendarEventDescription').textContent = isGoogle ? ([event.description, event.location ? `Location: ${event.location}` : ''].filter(Boolean).join(' · ') || 'Google Calendar event') : isCompletion ? 'Edit the date of this completed activity or remove it from your history.' : event.kind === 'frequency' ? (event.available ? 'This Progressive task is available. Complete it when ready.' : 'This task appears when its scheduled point in the period is reached.') : event.linked ? 'This task follows another routine. Its date moves automatically when the linked routine is rescheduled.' : 'Complete this task when it is due, or change its scheduled date.';
+  $('#calendarEventDescription').textContent = event.kind === 'google-task'
+    ? ([event.taskListTitle ? `Task list: ${event.taskListTitle}` : '', event.description || '', event.status === 'completed' ? 'Completed in Google Tasks' : 'Added in Google Tasks'].filter(Boolean).join(' · '))
+    : isGoogle ? ([event.description, event.location ? `Location: ${event.location}` : ''].filter(Boolean).join(' · ') || 'Google Calendar event')
+      : isCompletion ? 'Edit the date of this completed activity or remove it from your history.'
+        : event.kind === 'frequency' ? (event.available ? 'This task is available. Complete it when ready.' : 'This task appears when its scheduled point in the period is reached.')
+          : event.linked ? 'This task follows another routine. Its date moves automatically when the linked routine is rescheduled.'
+            : 'Complete this task when it is due, or change its scheduled date.';
   const canEditDate = isCompletion || (event.kind === 'due' && !event.linked);
   $('#calendarActionDateLabel').textContent = isCompletion ? 'Completion date' : 'Scheduled date';
   $('#calendarActionDateLabel').hidden = !canEditDate;

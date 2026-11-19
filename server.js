@@ -163,6 +163,25 @@ ensureColumn('google_tasks', 'completion_id', 'TEXT');
 ensureColumn('google_tasks', 'remote_updated_at', 'TEXT');
 ensureColumn('google_tasks', 'legacy_probe_done', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('google_accounts', 'last_task_sync', 'TEXT');
+ensureColumn('google_accounts', 'last_external_task_sync', 'TEXT');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS google_external_tasks (
+    account_key TEXT NOT NULL REFERENCES google_accounts(account_key) ON DELETE CASCADE,
+    tasklist_id TEXT NOT NULL,
+    tasklist_title TEXT NOT NULL DEFAULT 'Google Tasks',
+    task_id TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '(No title)',
+    notes TEXT,
+    due_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'needsAction',
+    completed_at TEXT,
+    updated_at TEXT,
+    PRIMARY KEY(account_key, tasklist_id, task_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_google_external_tasks_due
+    ON google_external_tasks(account_key, due_at);
+`);
 ensureColumn('routines', 'icon_name', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('routines', 'icon_color', "TEXT NOT NULL DEFAULT ''");
 
@@ -628,6 +647,85 @@ function applyRemoteGoogleTaskUpdate(userId, account, localTask, remote, changed
   }
 }
 
+async function syncGoogleManualTasks(userId, account) {
+  // Keep manually-created Google Tasks separate from Routine Tracker's mapped
+  // tasks. Only dated tasks belong on the calendar grid.
+  const tasks = tasksApi(account.account_key);
+  const state = db.prepare('SELECT last_external_task_sync FROM google_accounts WHERE account_key=?')
+    .get(account.account_key);
+  const lastSyncMs = Date.parse(state?.last_external_task_sync || '') || 0;
+  const updatedMin = lastSyncMs
+    ? new Date(Math.max(0, lastSyncMs - 2 * 60 * 1000)).toISOString()
+    : null;
+  const mappedIds = new Set(db.prepare('SELECT task_id FROM google_tasks WHERE account_key=?')
+    .all(account.account_key).map((row) => row.task_id));
+
+  // Discover every task list so tasks manually created in non-default lists
+  // are included too. The list endpoint is paginated and relatively small.
+  const taskLists = [];
+  let listPageToken = null;
+  do {
+    const response = await tasks.tasklists.list({
+      maxResults: 100,
+      ...(listPageToken ? { pageToken: listPageToken } : {}),
+      fields: 'items(id,title),nextPageToken'
+    });
+    taskLists.push(...(response.data.items || []));
+    listPageToken = response.data.nextPageToken || null;
+  } while (listPageToken);
+
+  const upsert = db.prepare(`INSERT INTO google_external_tasks(
+    account_key,tasklist_id,tasklist_title,task_id,title,notes,due_at,status,completed_at,updated_at
+  ) VALUES(?,?,?,?,?,?,?,?,?,?)
+  ON CONFLICT(account_key,tasklist_id,task_id) DO UPDATE SET
+    tasklist_title=excluded.tasklist_title,title=excluded.title,notes=excluded.notes,
+    due_at=excluded.due_at,status=excluded.status,completed_at=excluded.completed_at,
+    updated_at=excluded.updated_at`);
+  const remove = db.prepare('DELETE FROM google_external_tasks WHERE account_key=? AND tasklist_id=? AND task_id=?');
+
+  for (const taskList of taskLists) {
+    if (!taskList.id) continue;
+    let pageToken = null;
+    do {
+      const params = {
+        tasklist: taskList.id,
+        maxResults: 100,
+        showCompleted: true,
+        showDeleted: true,
+        showHidden: true,
+        fields: 'items(id,title,notes,due,status,completed,updated,deleted,hidden),nextPageToken',
+        ...(updatedMin ? { updatedMin } : {}),
+        ...(pageToken ? { pageToken } : {})
+      };
+      const response = await tasks.tasks.list(params);
+      for (const remote of (response.data.items || [])) {
+        if (!remote.id) continue;
+        // Mapped routine tasks are already represented by their routine due
+        // item or completion record. Do not display a duplicate calendar item.
+        if (mappedIds.has(remote.id)) {
+          remove.run(account.account_key, taskList.id, remote.id);
+          continue;
+        }
+        if (remote.deleted || remote.status === 'deleted' || !remote.due) {
+          remove.run(account.account_key, taskList.id, remote.id);
+          continue;
+        }
+        upsert.run(
+          account.account_key, taskList.id, taskList.title || 'Google Tasks', remote.id,
+          remote.title || '(No title)', remote.notes || null, remote.due,
+          remote.status || 'needsAction', remote.completed || null, remote.updated || null
+        );
+      }
+      pageToken = response.data.nextPageToken || null;
+    } while (pageToken);
+  }
+
+  const syncedAt = nowIso();
+  db.prepare('UPDATE google_accounts SET last_external_task_sync=?,updated_at=? WHERE account_key=?')
+    .run(syncedAt, syncedAt, account.account_key);
+  return { taskLists: taskLists.length };
+}
+
 async function syncGoogleTaskChanges(userId, account) {
   if (!account) return { skipped: true };
   const tasks = tasksApi(account.account_key);
@@ -688,6 +786,13 @@ async function syncGoogleTaskChanges(userId, account) {
   }
 
   for (const routineId of changedRoutines) recalculateRoutineAfterGoogleTaskChange(userId, routineId);
+  try {
+    await syncGoogleManualTasks(userId, account);
+  } catch (error) {
+    // A task-list failure should not block synchronization of Routine Tracker's
+    // own mapped tasks. Keep the external-task cursor unchanged so it retries.
+    console.warn(`Manual Google Tasks calendar sync failed for ${account.account_key}:`, error.message);
+  }
   const syncedAt = nowIso();
   db.prepare('UPDATE google_accounts SET last_task_sync=?,updated_at=? WHERE account_key=?')
     .run(syncedAt, syncedAt, account.account_key);
@@ -767,6 +872,7 @@ async function syncRoutineTasks(userId, routineIds = null, options = {}) {
 }
 const routineTaskPublishQueues = new Map();
 const taskPullQueues = new Map();
+const taskPullLastQueuedAt = new Map();
 
 function queueRoutineTaskPublish(userId, routineIds = null) {
   let queue = routineTaskPublishQueues.get(userId);
@@ -801,8 +907,15 @@ function queueTaskPullSync(userId) {
   if (taskPullQueues.has(userId) || taskSyncLocks.has(userId)) return;
   const account = getCurrentGoogleAccount(userId);
   if (!account) return;
-  const last = Date.parse(account.last_task_sync || '') || 0;
-  if (Date.now() - last < TASK_SYNC_BOOTSTRAP_COOLDOWN_MS) return;
+  const now = Date.now();
+  const lastQueued = taskPullLastQueuedAt.get(userId) || 0;
+  if (now - lastQueued < 15000) return;
+  const lastRoutineSync = Date.parse(account.last_task_sync || '') || 0;
+  const lastExternalSync = Date.parse(account.last_external_task_sync || '') || 0;
+  const routineFresh = lastRoutineSync && now - lastRoutineSync < TASK_SYNC_BOOTSTRAP_COOLDOWN_MS;
+  const externalFresh = lastExternalSync && now - lastExternalSync < TASK_SYNC_BOOTSTRAP_COOLDOWN_MS;
+  if (routineFresh && externalFresh) return;
+  taskPullLastQueuedAt.set(userId, now);
   const timer = setTimeout(async () => {
     taskPullQueues.delete(userId);
     if (taskSyncLocks.has(userId)) return;
@@ -1613,6 +1726,7 @@ app.get('/api/calendar', async (req, res) => {
     const account = getCurrentGoogleAccount(req.userId);
     let syncWarning = null;
     if (account) {
+      queueTaskPullSync(req.userId);
       const last = account.last_calendar_sync ? new Date(account.last_calendar_sync).getTime() : 0;
       if (Date.now() - last > CALENDAR_SYNC_INTERVAL_MS && !calendarSyncLocks.has(account.account_key)) {
         setImmediate(() => syncCalendarForAccount(account.account_key).catch((error) => {
@@ -1627,6 +1741,21 @@ app.get('/api/calendar', async (req, res) => {
         .all(account.account_key, end.toISOString().slice(0, 10) + 'T23:59:59.999Z', start.toISOString().slice(0, 10));
       for (const row of googleRows) events.push({ id: `g_${row.event_id}`, title: row.summary, start: row.start_at, end: row.end_at,
         allDay: Boolean(row.all_day), kind: 'google', location: row.location, description: row.description, url: row.html_link });
+      const externalTasks = db.prepare(`SELECT tasklist_id,tasklist_title,task_id,title,notes,due_at,status,completed_at
+        FROM google_external_tasks WHERE account_key=? AND due_at>=? AND due_at<?`)
+        .all(account.account_key, start.toISOString(), end.toISOString());
+      for (const task of externalTasks) events.push({
+        id: `gt_${task.tasklist_id}_${task.task_id}`,
+        title: task.title,
+        start: task.due_at,
+        allDay: true,
+        kind: 'google-task',
+        status: task.status,
+        completedAt: task.completed_at,
+        taskListTitle: task.tasklist_title,
+        description: task.notes || '',
+        url: 'https://calendar.google.com/calendar/u/0/r/tasks'
+      });
     }
     const routines = listRoutines(req.userId);
     for (const r of routines) {
@@ -1644,7 +1773,7 @@ app.get('/api/calendar', async (req, res) => {
       WHERE c.user_id=? AND c.completed_at>=? AND c.completed_at<? ORDER BY c.completed_at`)
       .all(req.userId, start.toISOString(), end.toISOString());
     for (const row of completionRows) events.push({ id: `done_${row.id}`, title: `${row.title} · completed`, start: row.completed_at, allDay: false, kind: 'completion', routineId: row.routine_id, completionId: row.id, color: row.color, note: row.note });
-    res.json({ month, events, googleLastSync: account?.last_calendar_sync || null, syncWarning });
+    res.json({ month, events, googleLastSync: account?.last_calendar_sync || null, googleTasksLastSync: account?.last_external_task_sync || null, syncWarning });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 

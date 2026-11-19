@@ -1511,3 +1511,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   outline-offset: 1px;
 }
 .date-entry-wrap { overflow: visible; }
+
+
+/* Four task/event previews are available on mobile too. Give each day enough
+   height for the four compact rows rather than clipping the last two. */
+@media (max-width: 680px) {
+  .calendar-day { min-height: 104px; }
+  .calendar-event { min-height: 13px; margin-top: 2px; padding: 1px 3px; font-size: 6.5px; line-height: 1.2; }
+}
