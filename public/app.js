@@ -519,14 +519,16 @@ function setPage(page) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-function loadCalendar() {
+function loadCalendar(options = {}) {
   const month = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
-  if (calendarLoadPromises.has(month)) return calendarLoadPromises.get(month);
+  const forceTaskRefresh = options.forceTaskRefresh === true;
+  const requestKey = `${month}${forceTaskRefresh ? ':force-tasks' : ''}`;
+  if (calendarLoadPromises.has(requestKey)) return calendarLoadPromises.get(requestKey);
   $('#calendarMonthTitle').textContent = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' }).format(state.calendarMonth);
   if (!state.calendarEvents.length) $('#calendarGrid').innerHTML = '<div class="calendar-empty">Loading your month…</div>';
   const request = (async () => {
     try {
-      const data = await api(`/api/calendar?month=${encodeURIComponent(month)}`);
+      const data = await api(`/api/calendar?month=${encodeURIComponent(month)}${forceTaskRefresh ? '&refreshTasks=1' : ''}`);
       // Ignore a late response if the user has already navigated to another month.
       const currentMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
       if (currentMonth !== month) return data;
@@ -554,9 +556,9 @@ function loadCalendar() {
       return null;
     }
   })();
-  calendarLoadPromises.set(month, request);
+  calendarLoadPromises.set(requestKey, request);
   return request.finally(() => {
-    if (calendarLoadPromises.get(month) === request) calendarLoadPromises.delete(month);
+    if (calendarLoadPromises.get(requestKey) === request) calendarLoadPromises.delete(requestKey);
   });
 }
 function calendarEventsForDate(key) {
@@ -1131,8 +1133,8 @@ async function calendarSync() {
   try {
     await api('/api/google/sync-calendar', { method: 'POST', body: JSON.stringify({}) });
     await loadBootstrap();
-    if (state.activePage === 'calendar') await loadCalendar();
-    toast('Google Calendar is up to date.');
+    if (state.activePage === 'calendar') await loadCalendar({ forceTaskRefresh: true });
+    toast('Google Calendar and Google Tasks are up to date.');
   } catch (error) { toast(error.message, 'error'); }
   finally { button.disabled = !state.google.connected; button.innerHTML = 'Refresh calendar <span>↻</span>'; }
 }

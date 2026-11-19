@@ -23,6 +23,7 @@ const DRIVE_AUTO_SYNC_DELAY_MS = Math.max(15000, Number(process.env.DRIVE_AUTO_S
 const CALENDAR_SYNC_INTERVAL_MS = Number(process.env.CALENDAR_SYNC_INTERVAL_MS || 300000);
 const TASK_SYNC_INTERVAL_MS = Number(process.env.TASK_SYNC_INTERVAL_MS || 180000);
 const TASK_SYNC_BOOTSTRAP_COOLDOWN_MS = Math.max(30000, Number(process.env.TASK_SYNC_BOOTSTRAP_COOLDOWN_MS || 60000));
+const TASK_MONTH_CACHE_MS = Math.max(5000, Number(process.env.TASK_MONTH_CACHE_MS || 15000));
 // Routine dates are date-based, while Google reports task completion timestamps
 // as UTC instants. Use the user's local calendar date when computing the next
 // occurrence; configure APP_TIME_ZONE if the server owner uses another zone.
@@ -181,6 +182,12 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_google_external_tasks_due
     ON google_external_tasks(account_key, due_at);
+  CREATE TABLE IF NOT EXISTS google_external_task_month_sync (
+    account_key TEXT NOT NULL REFERENCES google_accounts(account_key) ON DELETE CASCADE,
+    month TEXT NOT NULL,
+    synced_at TEXT NOT NULL,
+    PRIMARY KEY(account_key, month)
+  );
 `);
 ensureColumn('routines', 'icon_name', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('routines', 'icon_color', "TEXT NOT NULL DEFAULT ''");
@@ -666,7 +673,7 @@ async function syncGoogleManualTasks(userId, account) {
   let listPageToken = null;
   do {
     const response = await tasks.tasklists.list({
-      maxResults: 100,
+      maxResults: 1000,
       ...(listPageToken ? { pageToken: listPageToken } : {}),
       fields: 'items(id,title),nextPageToken'
     });
@@ -693,6 +700,7 @@ async function syncGoogleManualTasks(userId, account) {
         showCompleted: true,
         showDeleted: true,
         showHidden: true,
+        showAssigned: true,
         fields: 'items(id,title,notes,due,status,completed,updated,deleted,hidden),nextPageToken',
         ...(updatedMin ? { updatedMin } : {}),
         ...(pageToken ? { pageToken } : {})
@@ -724,6 +732,128 @@ async function syncGoogleManualTasks(userId, account) {
   db.prepare('UPDATE google_accounts SET last_external_task_sync=?,updated_at=? WHERE account_key=?')
     .run(syncedAt, syncedAt, account.account_key);
   return { taskLists: taskLists.length };
+}
+
+const manualTaskMonthLocks = new Set();
+
+// Fetch a complete, date-bounded snapshot for the month being viewed.
+// This deliberately does not use updatedMin: a task that predates the last
+// incremental cursor (or is an assigned task) must still be discoverable.
+// The month cache prevents repeated Google calls while navigating the UI.
+async function syncGoogleManualTasksForMonth(userId, account, month, force = false) {
+  if (!/^\d{4}-\d{2}$/.test(String(month || ''))) return { skipped: true, reason: 'invalid month' };
+  const [year, monthNumber] = month.split('-').map(Number);
+  if (monthNumber < 1 || monthNumber > 12) return { skipped: true, reason: 'invalid month' };
+
+  const cached = db.prepare('SELECT synced_at FROM google_external_task_month_sync WHERE account_key=? AND month=?')
+    .get(account.account_key, month);
+  const cachedAt = Date.parse(cached?.synced_at || '') || 0;
+  if (!force && cachedAt && Date.now() - cachedAt < TASK_MONTH_CACHE_MS) {
+    return { cached: true, syncedAt: cached.synced_at };
+  }
+
+  const lockKey = `${account.account_key}:${month}`;
+  if (manualTaskMonthLocks.has(lockKey)) return { skipped: true, reason: 'month sync already running' };
+  manualTaskMonthLocks.add(lockKey);
+  try {
+    const tasks = tasksApi(account.account_key);
+    const start = new Date(Date.UTC(year, monthNumber - 1, 1));
+    const end = new Date(Date.UTC(year, monthNumber, 1));
+    const dueMin = start.toISOString();
+    const dueMax = end.toISOString();
+    const mappedIds = new Set(db.prepare('SELECT task_id FROM google_tasks WHERE account_key=?')
+      .all(account.account_key).map((row) => row.task_id));
+
+    const taskLists = [];
+    let listPageToken = null;
+    do {
+      const response = await tasks.tasklists.list({
+        maxResults: 1000,
+        ...(listPageToken ? { pageToken: listPageToken } : {}),
+        fields: 'items(id,title),nextPageToken'
+      });
+      taskLists.push(...(response.data.items || []));
+      listPageToken = response.data.nextPageToken || null;
+    } while (listPageToken);
+
+    const records = [];
+    const seen = new Set();
+    for (const taskList of taskLists) {
+      if (!taskList.id) continue;
+      let pageToken = null;
+      do {
+        const response = await tasks.tasks.list({
+          tasklist: taskList.id,
+          maxResults: 100,
+          dueMin,
+          dueMax,
+          showCompleted: true,
+          showDeleted: true,
+          showHidden: true,
+          showAssigned: true,
+          fields: 'items(id,title,notes,due,status,completed,updated,deleted,hidden),nextPageToken',
+          ...(pageToken ? { pageToken } : {})
+        });
+        for (const remote of (response.data.items || [])) {
+          if (!remote.id) continue;
+          const key = `${taskList.id}\u0000${remote.id}`;
+          if (mappedIds.has(remote.id) || remote.deleted || remote.status === 'deleted' || !remote.due) continue;
+          const dueTime = Date.parse(remote.due);
+          if (!Number.isFinite(dueTime) || dueTime < start.getTime() || dueTime >= end.getTime()) continue;
+          records.push({
+            tasklist_id: taskList.id,
+            tasklist_title: taskList.title || 'Google Tasks',
+            task_id: remote.id,
+            title: remote.title || '(No title)',
+            notes: remote.notes || null,
+            due_at: remote.due,
+            status: remote.status || 'needsAction',
+            completed_at: remote.completed || null,
+            updated_at: remote.updated || null
+          });
+          seen.add(key);
+        }
+        pageToken = response.data.nextPageToken || null;
+      } while (pageToken);
+    }
+
+    const syncedAt = nowIso();
+    // Commit the snapshot only after every task-list page succeeded. If a
+    // request fails, the old cache remains intact and the next view retries.
+    const commit = db.transaction(() => {
+      const upsert = db.prepare(`INSERT INTO google_external_tasks(
+        account_key,tasklist_id,tasklist_title,task_id,title,notes,due_at,status,completed_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(account_key,tasklist_id,task_id) DO UPDATE SET
+        tasklist_title=excluded.tasklist_title,title=excluded.title,notes=excluded.notes,
+        due_at=excluded.due_at,status=excluded.status,completed_at=excluded.completed_at,
+        updated_at=excluded.updated_at`);
+      for (const row of records) {
+        upsert.run(account.account_key, row.tasklist_id, row.tasklist_title, row.task_id,
+          row.title, row.notes, row.due_at, row.status, row.completed_at, row.updated_at);
+      }
+
+      // Remove stale cached entries whose due date was moved out of this month,
+      // or whose task was deleted. The complete month snapshot makes this safe.
+      const oldRows = db.prepare(`SELECT tasklist_id,task_id FROM google_external_tasks
+        WHERE account_key=? AND due_at>=? AND due_at<?`).all(account.account_key, dueMin, dueMax);
+      const remove = db.prepare('DELETE FROM google_external_tasks WHERE account_key=? AND tasklist_id=? AND task_id=?');
+      for (const row of oldRows) {
+        if (!seen.has(`${row.tasklist_id}\u0000${row.task_id}`)) {
+          remove.run(account.account_key, row.tasklist_id, row.task_id);
+        }
+      }
+      db.prepare(`INSERT INTO google_external_task_month_sync(account_key,month,synced_at)
+        VALUES(?,?,?) ON CONFLICT(account_key,month) DO UPDATE SET synced_at=excluded.synced_at`)
+        .run(account.account_key, month, syncedAt);
+      db.prepare('UPDATE google_accounts SET last_external_task_sync=?,updated_at=? WHERE account_key=?')
+        .run(syncedAt, syncedAt, account.account_key);
+    });
+    commit();
+    return { synced: true, taskLists: taskLists.length, tasks: records.length, syncedAt };
+  } finally {
+    manualTaskMonthLocks.delete(lockKey);
+  }
 }
 
 async function syncGoogleTaskChanges(userId, account) {
@@ -1727,6 +1857,12 @@ app.get('/api/calendar', async (req, res) => {
     let syncWarning = null;
     if (account) {
       queueTaskPullSync(req.userId);
+      try {
+        await syncGoogleManualTasksForMonth(req.userId, account, month, req.query.refreshTasks === '1');
+      } catch (error) {
+        syncWarning = `Google Tasks could not be refreshed: ${error.message}`;
+        console.warn(`Google Tasks month sync failed for ${account.account_key} (${month}):`, error.message);
+      }
       const last = account.last_calendar_sync ? new Date(account.last_calendar_sync).getTime() : 0;
       if (Date.now() - last > CALENDAR_SYNC_INTERVAL_MS && !calendarSyncLocks.has(account.account_key)) {
         setImmediate(() => syncCalendarForAccount(account.account_key).catch((error) => {
