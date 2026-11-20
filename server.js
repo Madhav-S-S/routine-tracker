@@ -1316,7 +1316,7 @@ function queueDriveSync(userId) {
 const driveTimers = new Map();
 
 async function findDriveFileByName(drive, name) {
-  const escapedName = String(name).replace(/\\\\/g, '\\\\\\').replace(/'/g, "\\\\'");
+  const escapedName = String(name).replace(/'/g, "\\'");
   const found = await drive.files.list({
     q: `name = '${escapedName}' and trashed = false`,
     spaces: 'drive',
