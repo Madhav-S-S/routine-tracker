@@ -1329,16 +1329,6 @@ function listRoutines(userId, includeArchived = false) {
   const context = { periods, completionCounts, parentTitles, suppressedSlots };
   return rows.map((row) => publicRoutine(row, now, context));
 }
-function listRoutines(userId, includeArchived = false) {
-  // Keep linked child dates aligned with their parent's next occurrence even
-  // when a frequency period rolls over while the user is away from the app.
-  const parentRows = db.prepare(`SELECT DISTINCT p.id FROM routines p JOIN routines c
-    ON c.linked_to_routine_id=p.id AND c.user_id=p.user_id AND c.archived=0
-    WHERE p.user_id=? AND p.archived=0`).all(userId);
-  for (const parent of parentRows) updateLinkedRoutineSchedules(userId, parent.id);
-  const rows = db.prepare(`SELECT * FROM routines WHERE user_id = ? ${includeArchived ? '' : 'AND archived = 0'} ORDER BY created_at DESC`).all(userId);
-  return rows.map((row) => publicRoutine(row));
-}
 function getUserPublic(userId) {
   const user = db.prepare('SELECT id, email, display_name, picture, google_account_key FROM users WHERE id = ?').get(userId);
   if (!user) return { id: userId, display_name: 'Your space', email: null, picture: null, googleConnected: false };
@@ -2314,9 +2304,13 @@ app.get('/api/calendar', async (req, res) => {
         const due = new Date(r.next_due_at);
         if (due >= start && due < end) events.push({ id: `due_${r.id}`, title: `${r.title} · due`, start: r.next_due_at, allDay: true, kind: 'due', routineId: r.id, color: r.color, linked: Boolean(r.linked_to_routine_id), available: due.getTime() <= Date.now() });
       }
-      if (r.type === 'frequency' && r.checkinAvailable && !r.maximumReached && !r.taskSuppressed) {
-        const opportunity = new Date(r.nextOpportunityAt || r.periodStart);
-        if (opportunity >= start && opportunity < end) events.push({ id: `freq_${r.id}`, title: `${r.title} · task`, start: opportunity.toISOString(), allDay: true, kind: 'frequency', routineId: r.id, color: r.color, available: r.checkinAvailable });
+      if (r.type === 'frequency' && r.nextOpportunityAt && !r.maximumReached && !r.taskSuppressed) {
+        // Include the next progressive check-in even before it unlocks. The
+        // calendar marks it unavailable until its scheduled opportunity arrives.
+        const opportunity = new Date(r.nextOpportunityAt);
+        if (!Number.isNaN(opportunity.getTime()) && opportunity >= start && opportunity < end) {
+          events.push({ id: `freq_${r.id}`, title: `${r.title} · task`, start: opportunity.toISOString(), allDay: true, kind: 'frequency', routineId: r.id, color: r.color, available: r.checkinAvailable });
+        }
       }
     }
     const completionRows = db.prepare(`SELECT c.id,c.completed_at,c.note,r.title,r.color,r.id AS routine_id
