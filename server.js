@@ -549,6 +549,9 @@ async function deleteGoogleTask(accountKey, taskId) {
   }
 }
 const taskSyncLocks = new Set();
+// A connected account must restore its shared Drive state before any task
+// publisher or backup writer is allowed to run in this process.
+const driveRestoreReadyUsers = new Set();
 
 // Pull changes made in Google Tasks/Calendar back into Routine Tracker.
 // The Tasks API requires both showCompleted and showHidden to return tasks
@@ -962,6 +965,7 @@ async function syncGoogleTaskChanges(userId, account) {
   return { synced: true, checked: localRows.length, received: remoteCount, changedRoutines: changedRoutines.size };
 }
 async function syncRoutineTasks(userId, routineIds = null, options = {}) {
+  if (!driveRestoreReadyUsers.has(userId)) return { skipped: true, reason: 'Drive restore is not complete' };
   if (taskSyncLocks.has(userId)) return { skipped: true, reason: 'sync already running' };
   taskSyncLocks.add(userId);
   let mappingsChanged = false;
@@ -1296,7 +1300,7 @@ function statsFor(userId, routines) {
   return { routineCount: routines.length, completedThisMonth, dueCount, targetsMet };
 }
 function queueDriveSync(userId) {
-  if (!DRIVE_AUTO_SYNC) return;
+  if (!DRIVE_AUTO_SYNC || !driveRestoreReadyUsers.has(userId)) return;
   const user = db.prepare('SELECT google_account_key FROM users WHERE id = ?').get(userId);
   if (!user || !user.google_account_key) return;
   const oldTimer = driveTimers.get(userId);
@@ -1328,6 +1332,7 @@ async function findDriveFileByName(drive, name) {
 }
 
 async function syncDriveBackup(userId, options = {}) {
+  if (!driveRestoreReadyUsers.has(userId)) throw new Error('Drive restore must complete before a backup can be uploaded.');
   const user = db.prepare('SELECT google_account_key FROM users WHERE id = ?').get(userId);
   if (!user || !user.google_account_key) throw new Error('Connect Google before syncing to Drive.');
   const accountKey = user.google_account_key;
@@ -1501,6 +1506,7 @@ async function restoreDriveBackup(userId, options = {}) {
 
   if (!backup) {
     if (options.allowMissing) {
+      driveRestoreReadyUsers.add(userId);
       return { restored: false, routineCount: 0, completionCount: 0, googleTaskMappingCount: 0 };
     }
     throw new Error('No Routine Tracker SQLite or JSON backup was found in this Google Drive.');
@@ -1620,6 +1626,7 @@ async function restoreDriveBackup(userId, options = {}) {
     }
   }
 
+  driveRestoreReadyUsers.add(userId);
   const syncedAt = nowIso();
   db.prepare(`UPDATE google_accounts SET
     drive_file_id=COALESCE(?,drive_file_id),
@@ -2281,11 +2288,25 @@ const server = app.listen(PORT, () => {
 async function runBackgroundTaskSync() {
   const users = db.prepare('SELECT id FROM users WHERE google_account_key IS NOT NULL').all();
   for (const user of users) {
+    if (!driveRestoreReadyUsers.has(user.id)) continue;
     try { await syncRoutineTasks(user.id); }
     catch (error) { console.warn(`Google Tasks background sync failed for ${user.id}:`, error.message); }
   }
 }
-runBackgroundTaskSync().catch((error) => console.warn('Initial Google Tasks sync failed:', error.message));
+async function restoreDriveStateBeforeInitialTaskSync() {
+  const users = db.prepare('SELECT id FROM users WHERE google_account_key IS NOT NULL').all();
+  for (const user of users) {
+    try {
+      await restoreDriveBackup(user.id, { allowMissing: true });
+    } catch (error) {
+      // Keep publishing and backup uploads paused for this account until a
+      // manual Drive restore succeeds; never overwrite an unreadable backup.
+      console.error(`Initial Drive restore failed for ${user.id}; Google Task publishing is paused:`, error.message);
+    }
+  }
+  await runBackgroundTaskSync();
+}
+restoreDriveStateBeforeInitialTaskSync().catch((error) => console.warn('Initial Drive restore/task sync failed:', error.message));
 const taskSyncTimer = setInterval(() => {
   runBackgroundTaskSync().catch((error) => console.warn('Google Tasks background sync failed:', error.message));
 }, Math.max(30000, TASK_SYNC_INTERVAL_MS));
