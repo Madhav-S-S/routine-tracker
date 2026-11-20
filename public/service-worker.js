@@ -1,11 +1,11 @@
 'use strict';
 
-const CACHE_NAME = 'routine-tracker-shell-v3';
+const CACHE_NAME = 'routine-tracker-shell-v4';
 const APP_SHELL = [
   '/',
   '/index.html',
-  '/styles.css?v=20261120-speed-v1',
-  '/app.js?v=20261120-speed-v1',
+  '/styles.css?v=20261120-routine-calendar-v2',
+  '/app.js?v=20261120-routine-calendar-v2',
   '/favicon.svg',
   '/manifest.webmanifest',
   '/icons/icon-192.png',
