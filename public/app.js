@@ -483,7 +483,7 @@ function routineCard(routine) {
         <div class="routine-symbol">${renderRoutineIcon(routine.icon_name || suggestIconName(routine.title), iconTint, 19)}</div>
         <div class="routine-title-wrap"><h3 title="${escapeHtml(routine.title)}">${escapeHtml(routine.title)}</h3><p>${escapeHtml(isFrequency ? (routine.linked_to_routine_id ? 'Linked frequency target' : 'Frequency target') : routine.linked_to_routine_id ? 'Linked routine' : 'Repeat after completion')}</p></div>
         <button class="routine-menu" type="button" data-action="edit" data-id="${escapeHtml(routine.id)}" aria-label="Edit ${escapeHtml(routine.title)}" title="Edit">✎</button>
-        <button class="routine-menu" type="button" data-action="archive" data-id="${escapeHtml(routine.id)}" aria-label="Archive ${escapeHtml(routine.title)}" title="Archive">×</button>
+        <button class="routine-menu" type="button" data-action="archive" data-id="${escapeHtml(routine.id)}" aria-label="Delete ${escapeHtml(routine.title)}" title="Delete">×</button>
       </div>
       <div class="routine-meta"><span>${escapeHtml(isFrequency ? periodLabel(routine) : routine.cadenceLabel)}</span><strong>${escapeHtml(isFrequency ? `${routine.completedCount}/${routine.max_count}` : routine.daysUntilDue < 0 ? `${Math.abs(routine.daysUntilDue)}d late` : routine.daysUntilDue === 0 ? 'Today' : routine.daysUntilDue > 0 ? `${routine.daysUntilDue}d` : '—')}</strong></div>
       <div class="progress-track"><div class="progress-fill" style="width:${isFrequency ? progress : (routine.isDue ? 100 : Math.max(8, Math.min(100, 100 - routine.daysUntilDue * 5)))}%"></div></div>
@@ -987,11 +987,12 @@ async function completeRoutine(id) {
 }
 async function archiveRoutine(id) {
   const routine = state.routines.find((r) => r.id === id);
-  if (!routine || !confirm(`Archive “${routine.title}”? Its history will be kept.`)) return;
+  if (!routine || !confirm(`Delete “${routine.title}”? All of its activity history and scheduled tasks will also be removed. This cannot be undone.`)) return;
   try {
     await api(`/api/routines/${encodeURIComponent(id)}`, { method: 'DELETE' });
     await loadBootstrap();
-    toast('Routine archived. Its completion history is preserved.');
+    if (state.activePage === 'history') await loadHistory();
+    toast('Routine deleted. Its activity history was removed.');
   } catch (error) { toast(error.message, 'error'); }
 }
 
