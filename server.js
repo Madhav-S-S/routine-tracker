@@ -21,6 +21,8 @@ const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `${BASE_URL}/auth/google
 const DB_PATH = path.resolve(process.env.DATABASE_PATH || './data/routine-tracker.sqlite');
 const COOKIE_SECURE = String(process.env.COOKIE_SECURE || 'false').toLowerCase() === 'true';
 const DRIVE_AUTO_SYNC = String(process.env.DRIVE_AUTO_SYNC || 'true').toLowerCase() !== 'false';
+// Set false temporarily on the known-good source server when rebuilding a lost Drive mapping backup.
+const DRIVE_RESTORE_ON_STARTUP = String(process.env.DRIVE_RESTORE_ON_STARTUP || 'true').toLowerCase() !== 'false';
 const DRIVE_AUTO_SYNC_DELAY_MS = Math.max(15000, Number(process.env.DRIVE_AUTO_SYNC_DELAY_MS || 30000));
 const CALENDAR_SYNC_INTERVAL_MS = Number(process.env.CALENDAR_SYNC_INTERVAL_MS || 300000);
 const TASK_SYNC_INTERVAL_MS = Number(process.env.TASK_SYNC_INTERVAL_MS || 180000);
@@ -2297,7 +2299,14 @@ async function restoreDriveStateBeforeInitialTaskSync() {
   const users = db.prepare('SELECT id FROM users WHERE google_account_key IS NOT NULL').all();
   for (const user of users) {
     try {
-      await restoreDriveBackup(user.id, { allowMissing: true });
+      if (DRIVE_RESTORE_ON_STARTUP) {
+        await restoreDriveBackup(user.id, { allowMissing: true });
+      } else {
+        // Recovery mode: use this installation's existing mappings as the
+        // source of truth for one controlled migration backup.
+        driveRestoreReadyUsers.add(user.id);
+        console.warn(`Startup Drive restore disabled for ${user.id}; using its local SQLite data as the recovery source.`);
+      }
     } catch (error) {
       // Keep publishing and backup uploads paused for this account until a
       // manual Drive restore succeeds; never overwrite an unreadable backup.
