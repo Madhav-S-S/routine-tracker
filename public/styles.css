@@ -1571,3 +1571,133 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
     transform: translateY(-1px);
   }
 }
+
+
+/* Mobile viewport + modal scrolling repair.
+   Uses the dynamic visual viewport so browser chrome and the on-screen keyboard
+   cannot cover the routine editor. The modal sits above the fixed bottom nav. */
+html { scroll-padding-top: env(safe-area-inset-top); }
+body { min-height: 100%; overflow-x: hidden; }
+.app-shell { min-height: 100vh; min-height: 100dvh; }
+
+@media (max-width: 680px) {
+  .main-content {
+    min-height: 100vh;
+    min-height: 100dvh;
+    padding-bottom: calc(112px + env(safe-area-inset-bottom)) !important;
+  }
+
+  .modal-backdrop {
+    z-index: 100;
+    align-items: flex-start;
+    justify-content: center;
+    width: 100%;
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    padding: calc(12px + env(safe-area-inset-top)) 10px calc(12px + env(safe-area-inset-bottom));
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+    touch-action: pan-y pinch-zoom;
+  }
+
+  .routine-modal,
+  .calendar-event-modal,
+  .calendar-day-modal {
+    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - 24px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    touch-action: pan-y pinch-zoom;
+    scrollbar-gutter: stable;
+    margin: 0 auto;
+  }
+
+  .routine-modal {
+    width: min(100%, 550px);
+    padding: 18px 15px 16px;
+    border-radius: 18px;
+  }
+
+  .calendar-event-modal { width: min(100%, 470px); }
+
+  .calendar-day-backdrop {
+    padding: calc(12px + env(safe-area-inset-top)) 10px calc(12px + env(safe-area-inset-bottom));
+  }
+
+  .calendar-day-modal { width: 100%; }
+
+  /* Keep the editor above the mobile navigation; the nav remains fixed below it. */
+  .mobile-bottom-nav { z-index: 60; }
+}
+
+/* A more colourful accent system: keep the dark mineral base, but give
+   dashboard metrics, checklist rows, and settings panels distinct identities. */
+:root {
+  --accent-violet: #b49aff;
+  --accent-blue: #78baff;
+  --accent-teal: #69dfcf;
+  --accent-coral: #ff8b73;
+  --accent-gold: #ffd16f;
+  --accent-berry: #f18fbd;
+}
+
+.stats-grid .stat-card:nth-child(1) { border-top-color: var(--accent-gold); }
+.stats-grid .stat-card:nth-child(2) { border-top-color: var(--accent-teal); }
+.stats-grid .stat-card:nth-child(3) { border-top-color: var(--accent-coral); }
+.stats-grid .stat-card:nth-child(4) { border-top-color: var(--accent-blue); }
+.stats-grid .stat-card:nth-child(1) .stat-icon { color: var(--accent-gold); background: rgba(255,209,111,.13); border: 1px solid rgba(255,209,111,.24); }
+.stats-grid .stat-card:nth-child(2) .stat-icon { color: var(--accent-teal); background: rgba(105,223,207,.13); border: 1px solid rgba(105,223,207,.24); }
+.stats-grid .stat-card:nth-child(3) .stat-icon { color: var(--accent-coral); background: rgba(255,139,115,.13); border: 1px solid rgba(255,139,115,.24); }
+.stats-grid .stat-card:nth-child(4) .stat-icon { color: var(--accent-blue); background: rgba(120,186,255,.13); border: 1px solid rgba(120,186,255,.24); }
+.stats-grid .stat-card:nth-child(1) .stat-value { color: #ffd69a; }
+.stats-grid .stat-card:nth-child(2) .stat-value { color: #9aeee1; }
+.stats-grid .stat-card:nth-child(3) .stat-value { color: #ffad9c; }
+.stats-grid .stat-card:nth-child(4) .stat-value { color: #a8d0ff; }
+
+.checklist-card {
+  border-left: 3px solid var(--routine-accent, var(--accent-citrus));
+  background: linear-gradient(105deg, color-mix(in srgb, var(--routine-accent, var(--accent-citrus)) 11%, #202b24), #202b24 58%);
+}
+.check-action {
+  color: var(--routine-accent, var(--accent-citrus));
+  background: color-mix(in srgb, var(--routine-accent, var(--accent-citrus)) 13%, #172019);
+  border-color: color-mix(in srgb, var(--routine-accent, var(--accent-citrus)) 38%, #354338);
+  box-shadow: 0 0 13px color-mix(in srgb, var(--routine-accent, var(--accent-citrus)) 9%, transparent);
+}
+.routine-card.custom-routine-color:before {
+  background: var(--routine-accent, var(--accent-citrus)) !important;
+  box-shadow: 0 0 16px color-mix(in srgb, var(--routine-accent, var(--accent-citrus)) 42%, transparent);
+}
+.routine-card.custom-routine-color {
+  background: linear-gradient(145deg, color-mix(in srgb, var(--routine-accent, var(--accent-citrus)) 8%, #202922), #202922 62%);
+}
+
+.type-option[data-type="frequency"] > span { color: var(--accent-violet); background: rgba(180,154,255,.14); }
+.type-option[data-type="interval"] > span { color: var(--accent-teal); background: rgba(105,223,207,.13); }
+.type-option[data-type="frequency"].active { border-color: var(--accent-violet); background: rgba(180,154,255,.10); box-shadow: 0 0 0 1px rgba(180,154,255,.15); }
+.type-option[data-type="interval"].active { border-color: var(--accent-teal); background: rgba(105,223,207,.09); box-shadow: 0 0 0 1px rgba(105,223,207,.14); }
+
+.color-choice.lavender { background: #b49aff; }
+.color-choice.mint { background: #55d9b5; }
+.color-choice.peach { background: #ff9a76; }
+.color-choice.blue { background: #78baff; }
+.color-choice.rose { background: #f18fbd; }
+.color-choice.gold { background: #ffd16f; }
+
+.settings-card:nth-child(1) { border-top: 2px solid var(--accent-blue); }
+.settings-card:nth-child(2) { border-top: 2px solid var(--accent-violet); }
+.settings-card:nth-child(3) { border-top: 2px solid var(--accent-teal); }
+.google-icon { color: var(--accent-blue); }
+.drive-icon { color: var(--accent-violet); }
+.calendar-icon { color: var(--accent-teal); }
+
+.history-entry:nth-child(4n+1) .history-mark { color: var(--accent-teal); background: rgba(105,223,207,.13); }
+.history-entry:nth-child(4n+2) .history-mark { color: var(--accent-blue); background: rgba(120,186,255,.13); }
+.history-entry:nth-child(4n+3) .history-mark { color: var(--accent-coral); background: rgba(255,139,115,.13); }
+.history-entry:nth-child(4n+4) .history-mark { color: var(--accent-berry); background: rgba(241,143,189,.13); }
