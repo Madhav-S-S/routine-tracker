@@ -25,7 +25,14 @@ a { color: inherit; text-decoration: none; }
 [hidden] { display: none !important; }
 .app-shell { min-height: 100vh; }
 .sidebar { width: 254px; position: fixed; z-index: 20; inset: 0 auto 0 0; display: flex; flex-direction: column; padding: 29px 18px 18px; background: #fff; border-right: 1px solid #efedf3; }
-.brand { display: inline-flex; align-items: center; gap: 11px; padding: 0 14px; margin-bottom: 53px; }
+.brand-row { display: flex; align-items: center; gap: 4px; }
+.sidebar-brand-row { min-height: 36px; margin-bottom: 53px; }
+.sidebar-brand-row .brand { flex: 1 1 auto; margin: 0; }
+.topbar-brand-row { display: none; }
+.brand-back-button { display: none; flex: 0 0 30px; width: 30px; height: 30px; place-items: center; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); color: var(--muted); font-size: 17px; line-height: 1; transition: background .18s ease, color .18s ease, border-color .18s ease; }
+.brand-back-button:hover { background: var(--purple-pale); color: var(--purple); border-color: var(--purple); }
+body.settings-open .brand-back-button { display: grid; }
+.brand { display: inline-flex; align-items: center; gap: 11px; padding: 0 14px; margin-bottom: 0; }
 .brand-mark { width: 27px; height: 27px; display: inline-flex; align-items: end; justify-content: center; gap: 3px; padding: 5px 4px; border-radius: 9px; background: #ece8fb; transform: rotate(-5deg); }
 .brand-mark span { width: 4px; border-radius: 8px; background: #7f6bcb; display: block; }
 .brand-mark span:nth-child(1) { height: 8px; opacity: .7; }.brand-mark span:nth-child(2) { height: 15px; }.brand-mark span:nth-child(3) { height: 11px; opacity: .82; }
@@ -531,6 +538,8 @@ body { background: radial-gradient(ellipse at 12% 0%, rgba(116,80,185,.12), tran
     justify-content: space-between;
     gap: 12px;
   }
+  .topbar-brand-row { display: flex; align-items: center; gap: 7px; margin-right: auto; min-width: 0; }
+  .topbar-brand-row .brand-back-button { flex: 0 0 30px; }
   .mobile-topbar-brand {
     display: inline-flex;
     align-items: center;
