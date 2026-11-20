@@ -833,7 +833,13 @@ function openRoutineModal(routine = null) {
   $$('.type-option').forEach((button) => { button.disabled = Boolean(routine); button.style.opacity = routine ? '.65' : '1'; });
   $('#routineModal').hidden = false;
   document.body.style.overflow = 'hidden';
-  setTimeout(() => $('#routineTitle').focus(), 40);
+  const routineDialog = $('#routineModal .routine-modal');
+  if (routineDialog) routineDialog.scrollTop = 0;
+  // Do not auto-open the phone keyboard when the modal appears. It changes
+  // the visual viewport and can jump the dialog under the browser address bar.
+  if (window.matchMedia('(min-width: 681px)').matches) {
+    setTimeout(() => $('#routineTitle').focus({ preventScroll: true }), 40);
+  }
 }
 function closeRoutineModal() {
   $('#routineModal').hidden = true;
