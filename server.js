@@ -1515,6 +1515,8 @@ async function restoreDriveBackup(userId, options = {}) {
   let routineCount = 0;
   let completionCount = 0;
   let googleTaskMappingCount = 0;
+  let duplicateRemoteTasksRemoved = 0;
+  const duplicateRemoteTaskIds = [];
   const importTransaction = db.transaction(() => {
     const routineIdMap = new Map();
     for (const r of backup.routines) {
@@ -1575,8 +1577,13 @@ async function restoreDriveBackup(userId, options = {}) {
       if (otherOwner && otherOwner.routine_id !== targetRoutineId) continue;
       const current = db.prepare('SELECT task_id,status FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=?')
         .get(accountKey, targetRoutineId, String(mapping.slot_key));
-      if (current && current.task_id !== String(mapping.task_id) &&
-          !['deleted', 'completed'].includes(current.status)) continue;
+      // The Drive backup is the shared source of truth for cross-server task IDs.
+      // If this installation independently created a pending task for the same
+      // routine occurrence, remove that mapped duplicate and restore the backup
+      // ID. Never touch arbitrary Google Tasks or completed local tasks.
+      if (current && current.task_id !== String(mapping.task_id) && current.status === 'needsAction') {
+        duplicateRemoteTaskIds.push(current.task_id);
+      }
       db.prepare(`INSERT INTO google_tasks(
         account_key,routine_id,slot_key,task_id,due_date,status,updated_at,completion_id,
         remote_updated_at,legacy_probe_done,identity_marker_added
@@ -1586,7 +1593,7 @@ async function restoreDriveBackup(userId, options = {}) {
         updated_at=excluded.updated_at,completion_id=excluded.completion_id,
         remote_updated_at=excluded.remote_updated_at,legacy_probe_done=excluded.legacy_probe_done,
         identity_marker_added=excluded.identity_marker_added
-      WHERE excluded.updated_at >= google_tasks.updated_at OR google_tasks.status='deleted'`)
+      `)
         .run(accountKey, targetRoutineId, String(mapping.slot_key), String(mapping.task_id),
           String(mapping.due_date || ''), ['needsAction', 'completed', 'deleted'].includes(mapping.status) ? mapping.status : 'needsAction',
           mapping.updated_at || nowIso(), mapping.completion_id || null, mapping.remote_updated_at || null,
@@ -1604,6 +1611,15 @@ async function restoreDriveBackup(userId, options = {}) {
   });
   importTransaction();
 
+  for (const duplicateTaskId of new Set(duplicateRemoteTaskIds)) {
+    try {
+      await deleteGoogleTask(accountKey, duplicateTaskId);
+      duplicateRemoteTasksRemoved++;
+    } catch (error) {
+      console.warn('Could not remove a duplicate Google Task during Drive restore:', error.message);
+    }
+  }
+
   const syncedAt = nowIso();
   db.prepare(`UPDATE google_accounts SET
     drive_file_id=COALESCE(?,drive_file_id),
@@ -1617,6 +1633,7 @@ async function restoreDriveBackup(userId, options = {}) {
     routineCount,
     completionCount,
     googleTaskMappingCount,
+    duplicateRemoteTasksRemoved,
     backupExportedAt: backup.exportedAt || null,
     source: selected.kind
   };
