@@ -4,8 +4,10 @@ require('dotenv').config();
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { Readable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 const express = require('express');
 const session = require('express-session');
 const Database = require('better-sqlite3');
@@ -24,12 +26,13 @@ const CALENDAR_SYNC_INTERVAL_MS = Number(process.env.CALENDAR_SYNC_INTERVAL_MS |
 const TASK_SYNC_INTERVAL_MS = Number(process.env.TASK_SYNC_INTERVAL_MS || 180000);
 const TASK_SYNC_BOOTSTRAP_COOLDOWN_MS = Math.max(30000, Number(process.env.TASK_SYNC_BOOTSTRAP_COOLDOWN_MS || 60000));
 const TASK_MONTH_CACHE_MS = Math.max(5000, Number(process.env.TASK_MONTH_CACHE_MS || 15000));
+const DATABASE_BACKUP_INTERVAL_MS = Math.max(60000, Number(process.env.DATABASE_BACKUP_INTERVAL_MS || 300000));
 // Routine dates are date-based, while Google reports task completion timestamps
 // as UTC instants. Use the user's local calendar date when computing the next
 // occurrence; configure APP_TIME_ZONE if the server owner uses another zone.
 const APP_TIME_ZONE = process.env.APP_TIME_ZONE || 'Asia/Kolkata';
 const SESSION_MAX_AGE = 1000 * 60 * 60 * 24 * 365;
-const APP_VERSION = '1.7.0';
+const APP_VERSION = '1.8.0';
 
 if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.includes('replace-with')) {
   throw new Error('Set SESSION_SECRET in your .env file before starting the app.');
@@ -165,6 +168,9 @@ ensureColumn('google_tasks', 'remote_updated_at', 'TEXT');
 ensureColumn('google_tasks', 'legacy_probe_done', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('google_accounts', 'last_task_sync', 'TEXT');
 ensureColumn('google_accounts', 'last_external_task_sync', 'TEXT');
+ensureColumn('google_accounts', 'database_backup_file_id', 'TEXT');
+ensureColumn('google_accounts', 'last_database_backup', 'TEXT');
+ensureColumn('google_tasks', 'identity_marker_added', 'INTEGER NOT NULL DEFAULT 0');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS google_external_tasks (
@@ -503,6 +509,33 @@ function routineTaskSlotKey(routine, item = null) {
     return `frequency:${publicItem.periodStart}:${publicItem.completedCount}`;
   }
   return null;
+}
+
+// A stable marker travels with each task in Google Tasks. Separate SQLite
+// installations can therefore rediscover the same remote task instead of
+// creating another copy when their local mapping table is empty.
+function routineTaskMarker(routineId, slotKey) {
+  return `[[Routine Tracker task:${sha256(`${routineId}\\u0000${slotKey}`).slice(0, 32)}]]`;
+}
+function routineTaskNotes(routine, slotKey) {
+  const baseNotes = String(routine.notes || 'Routine Tracker checklist item');
+  const marker = routineTaskMarker(routine.id, slotKey);
+  return baseNotes.includes(marker) ? baseNotes : `${baseNotes}\\n\\n${marker}`;
+}
+async function listAllDefaultGoogleTasks(tasks) {
+  const results = [];
+  let pageToken = null;
+  do {
+    const response = await tasks.tasks.list({
+      tasklist: '@default', maxResults: 100,
+      showCompleted: true, showDeleted: true, showHidden: true,
+      fields: 'items(id,title,notes,due,status,completed,updated,deleted,hidden),nextPageToken',
+      ...(pageToken ? { pageToken } : {})
+    });
+    results.push(...(response.data.items || []));
+    pageToken = response.data.nextPageToken || null;
+  } while (pageToken);
+  return results;
 }
 function isRoutineTaskSuppressed(userId, routineId, slotKey) {
   return Boolean(slotKey && db.prepare('SELECT 1 FROM routine_task_suppressions WHERE user_id=? AND routine_id=? AND slot_key=?').get(userId, routineId, slotKey));
@@ -931,71 +964,152 @@ async function syncGoogleTaskChanges(userId, account) {
 async function syncRoutineTasks(userId, routineIds = null, options = {}) {
   if (taskSyncLocks.has(userId)) return { skipped: true, reason: 'sync already running' };
   taskSyncLocks.add(userId);
+  let mappingsChanged = false;
   try {
-  const account = getCurrentGoogleAccount(userId);
-  if (!account) return { skipped: true };
-  if (options.pullChanges !== false) await syncGoogleTaskChanges(userId, account);
-  const allRoutines = listRoutines(userId);
-  const selectedIds = Array.isArray(routineIds) ? new Set(routineIds.map((value) => typeof value === 'string' ? value : value?.id).filter(Boolean)) : null;
-  const routines = selectedIds ? allRoutines.filter((routine) => selectedIds.has(routine.id)) : allRoutines;
-  const tasks = tasksApi(account.account_key);
-  // Full archived-task cleanup is only needed during a full/background sync.
-  const archivedTasks = selectedIds ? [] : db.prepare(`SELECT gt.* FROM google_tasks gt
-    JOIN routines r ON r.id=gt.routine_id
-    WHERE gt.account_key=? AND r.user_id=? AND r.archived=1 AND gt.status<>'deleted'`)
-    .all(account.account_key, userId);
-  for (const oldTask of archivedTasks) {
-    try {
-      await deleteGoogleTask(account.account_key, oldTask.task_id);
-      db.prepare("UPDATE google_tasks SET status='deleted',updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
-        .run(nowIso(), account.account_key, oldTask.routine_id, oldTask.slot_key);
-    } catch (error) {
-      console.warn('Could not clean up a task belonging to an archived routine:', error.message);
-    }
-  }
-  for (const routine of routines) {
-    let dueDate = null;
-    let slotKey = '';
-    if (routine.type === 'interval' && routine.next_due_at) {
-      // A linked task is only eligible again after its parent moves to a new due date.
-      if (routine.linked_to_routine_id && routine.last_completed_at &&
-          new Date(routine.last_completed_at).getTime() >= new Date(routine.next_due_at).getTime()) continue;
-      dueDate = isoDateOnly(routine.next_due_at);
-      slotKey = routineTaskSlotKey(routine);
-    } else if (routine.type === 'frequency' && routine.checkinAvailable) {
-      // Create frequency tasks only when the next Progressive opportunity is visible.
-      dueDate = isoDateOnly(nowIso());
-      slotKey = routineTaskSlotKey(routine);
-    }
-    if (!dueDate || !slotKey) continue;
-    if (isRoutineTaskSuppressed(userId, routine.id, slotKey)) continue;
+    const account = getCurrentGoogleAccount(userId);
+    if (!account) return { skipped: true };
+    if (options.pullChanges !== false) await syncGoogleTaskChanges(userId, account);
+    const allRoutines = listRoutines(userId);
+    const selectedIds = Array.isArray(routineIds)
+      ? new Set(routineIds.map((value) => typeof value === 'string' ? value : value?.id).filter(Boolean))
+      : null;
+    const routines = selectedIds ? allRoutines.filter((routine) => selectedIds.has(routine.id)) : allRoutines;
+    const tasks = tasksApi(account.account_key);
+    let remoteTaskSnapshot = null;
+    const getRemoteTaskSnapshot = async () => {
+      if (!remoteTaskSnapshot) remoteTaskSnapshot = await listAllDefaultGoogleTasks(tasks);
+      return remoteTaskSnapshot;
+    };
 
-    let existing = db.prepare('SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=?')
-      .get(account.account_key, routine.id, slotKey);
-    if (!existing) {
-      existing = db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='needsAction' ORDER BY updated_at DESC LIMIT 1")
-        .get(account.account_key, routine.id);
-    }
-    const requestBody = { title: routine.title, notes: routine.notes || 'Routine Tracker checklist item', due: `${dueDate}T00:00:00.000Z` };
-    if (existing && (existing.status === 'deleted' || existing.status === 'completed')) {
-      // A completed occurrence is terminal. Do not turn it back into a pending
-      // Google Task just because the routine still calculates the same slot.
-      // The next occurrence gets a distinct slot key and its own Task.
-      continue;
-    }
-    if (existing) {
-      if (existing.slot_key !== slotKey || existing.due_date !== dueDate) {
-        const patched = await tasks.tasks.patch({ tasklist: '@default', task: existing.task_id, requestBody });
-        db.prepare('UPDATE google_tasks SET slot_key=?,due_date=?,remote_updated_at=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
-          .run(slotKey, dueDate, toIso(patched.data?.updated, null), nowIso(), account.account_key, routine.id, existing.slot_key);
+    // Full archived-task cleanup is only needed during a full/background sync.
+    const archivedTasks = selectedIds ? [] : db.prepare(`SELECT gt.* FROM google_tasks gt
+      JOIN routines r ON r.id=gt.routine_id
+      WHERE gt.account_key=? AND r.user_id=? AND r.archived=1 AND gt.status<>'deleted'`)
+      .all(account.account_key, userId);
+    for (const oldTask of archivedTasks) {
+      try {
+        await deleteGoogleTask(account.account_key, oldTask.task_id);
+        db.prepare("UPDATE google_tasks SET status='deleted',updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
+          .run(nowIso(), account.account_key, oldTask.routine_id, oldTask.slot_key);
+        mappingsChanged = true;
+      } catch (error) {
+        console.warn('Could not clean up a task belonging to an archived routine:', error.message);
       }
-      continue;
     }
-    const created = await tasks.tasks.insert({ tasklist: '@default', requestBody });
-    db.prepare('INSERT INTO google_tasks(account_key,routine_id,slot_key,task_id,due_date,status,updated_at,remote_updated_at) VALUES(?,?,?,?,?,?,?,?)')
-      .run(account.account_key, routine.id, slotKey, created.data.id, dueDate, 'needsAction', nowIso(), toIso(created.data?.updated, null));
-  }
-  return { synced: true };
+
+    for (const routine of routines) {
+      let dueDate = null;
+      let slotKey = '';
+      if (routine.type === 'interval' && routine.next_due_at) {
+        if (routine.linked_to_routine_id && routine.last_completed_at &&
+            new Date(routine.last_completed_at).getTime() >= new Date(routine.next_due_at).getTime()) continue;
+        dueDate = isoDateOnly(routine.next_due_at);
+        slotKey = routineTaskSlotKey(routine);
+      } else if (routine.type === 'frequency' && routine.checkinAvailable) {
+        dueDate = isoDateOnly(nowIso());
+        slotKey = routineTaskSlotKey(routine);
+      }
+      if (!dueDate || !slotKey) continue;
+      if (isRoutineTaskSuppressed(userId, routine.id, slotKey)) continue;
+
+      let existing = db.prepare('SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=?')
+        .get(account.account_key, routine.id, slotKey);
+      if (!existing) {
+        existing = db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='needsAction' ORDER BY updated_at DESC LIMIT 1")
+          .get(account.account_key, routine.id);
+      }
+
+      const marker = routineTaskMarker(routine.id, slotKey);
+      const requestBody = {
+        title: routine.title,
+        notes: routineTaskNotes(routine, slotKey),
+        due: `${dueDate}T00:00:00.000Z`
+      };
+
+      // Recover a missing SQLite mapping before creating anything remotely.
+      // Prefer the exact stable marker. For tasks created by older versions,
+      // adopt a single exact title + due-date + notes match; never delete
+      // ambiguous matches because one could be a manually-created task.
+      if (!existing) {
+        const remoteTasks = await getRemoteTaskSnapshot();
+        let candidate = remoteTasks.find((remote) => remote.id && String(remote.notes || '').includes(marker));
+        if (!candidate) {
+          const legacyNotes = String(routine.notes || 'Routine Tracker checklist item');
+          const legacyMatches = remoteTasks.filter((remote) =>
+            remote.id &&
+            !remote.deleted &&
+            remote.status === 'needsAction' &&
+            remote.title === routine.title &&
+            remote.due &&
+            isoDateOnly(remote.due) === dueDate &&
+            String(remote.notes || '') === legacyNotes
+          );
+          if (legacyMatches.length) {
+            candidate = legacyMatches[0];
+            if (legacyMatches.length > 1) {
+              console.warn(`Found ${legacyMatches.length} legacy Google Tasks matching routine "${routine.title}" on ${dueDate}; adopted one and left the others untouched.`);
+            }
+          }
+        }
+        if (candidate) {
+          let adopted = candidate;
+          const remoteStatus = candidate.deleted || candidate.status === 'deleted'
+            ? 'deleted'
+            : (candidate.status === 'completed' || candidate.completed || candidate.hidden)
+              ? 'completed' : 'needsAction';
+          if (remoteStatus !== 'deleted' && !String(candidate.notes || '').includes(marker)) {
+            const patched = await tasks.tasks.patch({
+              tasklist: '@default', task: candidate.id, requestBody
+            });
+            adopted = patched.data || candidate;
+            if (remoteTaskSnapshot) {
+              const ix = remoteTaskSnapshot.findIndex((row) => row.id === candidate.id);
+              if (ix >= 0) remoteTaskSnapshot[ix] = adopted;
+            }
+          }
+          db.prepare(`INSERT INTO google_tasks(
+            account_key,routine_id,slot_key,task_id,due_date,status,updated_at,remote_updated_at,identity_marker_added
+          ) VALUES(?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(account_key,routine_id,slot_key) DO UPDATE SET
+            task_id=excluded.task_id,due_date=excluded.due_date,status=excluded.status,
+            updated_at=excluded.updated_at,remote_updated_at=excluded.remote_updated_at,
+            identity_marker_added=excluded.identity_marker_added`)
+            .run(account.account_key, routine.id, slotKey, candidate.id, dueDate, remoteStatus,
+              nowIso(), toIso(adopted.updated, null), remoteStatus === 'deleted' ? 0 : 1);
+          existing = db.prepare('SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=?')
+            .get(account.account_key, routine.id, slotKey);
+          mappingsChanged = true;
+        }
+      }
+
+      if (existing && (existing.status === 'deleted' || existing.status === 'completed')) {
+        continue;
+      }
+      if (existing) {
+        if (existing.slot_key !== slotKey || existing.due_date !== dueDate || !existing.identity_marker_added) {
+          const patched = await tasks.tasks.patch({
+            tasklist: '@default', task: existing.task_id, requestBody
+          });
+          db.prepare(`UPDATE google_tasks SET slot_key=?,due_date=?,remote_updated_at=?,updated_at=?,
+            identity_marker_added=1 WHERE account_key=? AND routine_id=? AND slot_key=?`)
+            .run(slotKey, dueDate, toIso(patched.data?.updated, null), nowIso(),
+              account.account_key, routine.id, existing.slot_key);
+          mappingsChanged = true;
+        }
+        continue;
+      }
+
+      const created = await tasks.tasks.insert({ tasklist: '@default', requestBody });
+      db.prepare(`INSERT INTO google_tasks(
+        account_key,routine_id,slot_key,task_id,due_date,status,updated_at,remote_updated_at,identity_marker_added
+      ) VALUES(?,?,?,?,?,?,?,?,1)`)
+        .run(account.account_key, routine.id, slotKey, created.data.id, dueDate,
+          'needsAction', nowIso(), toIso(created.data?.updated, null));
+      if (remoteTaskSnapshot) remoteTaskSnapshot.push(created.data);
+      mappingsChanged = true;
+    }
+    if (mappingsChanged) queueDriveSync(userId);
+    return { synced: true, mappingsUpdated: mappingsChanged };
   } finally {
     taskSyncLocks.delete(userId);
   }
@@ -1201,49 +1315,114 @@ function queueDriveSync(userId) {
 }
 const driveTimers = new Map();
 
-async function syncDriveBackup(userId) {
+async function findDriveFileByName(drive, name) {
+  const escapedName = String(name).replace(/\\\\/g, '\\\\\\').replace(/'/g, "\\\\'");
+  const found = await drive.files.list({
+    q: `name = '${escapedName}' and trashed = false`,
+    spaces: 'drive',
+    pageSize: 10,
+    orderBy: 'modifiedTime desc',
+    fields: 'files(id,name,modifiedTime)'
+  });
+  return (found.data.files || [])[0]?.id || null;
+}
+
+async function syncDriveBackup(userId, options = {}) {
   const user = db.prepare('SELECT google_account_key FROM users WHERE id = ?').get(userId);
   if (!user || !user.google_account_key) throw new Error('Connect Google before syncing to Drive.');
   const accountKey = user.google_account_key;
   const drive = driveApi(accountKey);
   const routines = db.prepare('SELECT * FROM routines WHERE user_id = ? ORDER BY created_at').all(userId);
-  const completions = db.prepare(`SELECT c.* FROM completions c WHERE c.user_id = ? ORDER BY c.completed_at`).all(userId);
+  const completions = db.prepare('SELECT * FROM completions WHERE user_id = ? ORDER BY completed_at').all(userId);
+  const googleTasks = db.prepare(`SELECT gt.* FROM google_tasks gt
+    JOIN routines r ON r.id=gt.routine_id
+    WHERE gt.account_key=? AND r.user_id=? ORDER BY gt.routine_id,gt.slot_key`)
+    .all(accountKey, userId);
+  const taskSuppressions = db.prepare('SELECT * FROM routine_task_suppressions WHERE user_id=? ORDER BY routine_id,slot_key')
+    .all(userId);
   const backup = {
     product: 'Routine Tracker',
-    formatVersion: 1,
+    formatVersion: 2,
     exportedAt: nowIso(),
     routines,
-    completions
+    completions,
+    googleTasks,
+    taskSuppressions
   };
-  let account = db.prepare('SELECT drive_file_id FROM google_accounts WHERE account_key = ?').get(accountKey);
-  let fileId = account && account.drive_file_id;
-  if (!fileId) {
-    const found = await drive.files.list({
-      q: "name = 'Routine Tracker Backup.json' and trashed = false",
-      spaces: 'drive',
-      pageSize: 10,
-      fields: 'files(id,name,modifiedTime)'
-    });
-    fileId = (found.data.files || [])[0]?.id || null;
-  }
-  const body = Readable.from([Buffer.from(JSON.stringify(backup, null, 2), 'utf8')]);
+
+  let account = db.prepare(`SELECT drive_file_id,database_backup_file_id,last_database_backup
+    FROM google_accounts WHERE account_key=?`).get(accountKey);
+  let fileId = account?.drive_file_id || await findDriveFileByName(drive, 'Routine Tracker Backup.json');
+  const jsonBody = Readable.from([Buffer.from(JSON.stringify(backup, null, 2), 'utf8')]);
   if (fileId) {
     await drive.files.update({
       fileId,
-      media: { mimeType: 'application/json', body },
+      media: { mimeType: 'application/json', body: jsonBody },
       fields: 'id,name,modifiedTime'
     });
   } else {
     const created = await drive.files.create({
       requestBody: { name: 'Routine Tracker Backup.json', mimeType: 'application/json' },
-      media: { mimeType: 'application/json', body },
+      media: { mimeType: 'application/json', body: jsonBody },
       fields: 'id,name,modifiedTime'
     });
     fileId = created.data.id;
   }
-  db.prepare(`UPDATE google_accounts SET drive_file_id = ?, last_drive_sync = ?, last_error = NULL, updated_at = ? WHERE account_key = ?`)
-    .run(fileId, nowIso(), nowIso(), accountKey);
-  return { fileId, exportedAt: backup.exportedAt, routineCount: routines.length, completionCount: completions.length };
+
+  // Keep a real, transactionally-consistent SQLite snapshot in the same user's
+  // Drive as well as the portable JSON export. The binary snapshot preserves
+  // internal mappings and sync state that a routines-only export cannot.
+  const lastDatabaseBackupMs = Date.parse(account?.last_database_backup || '') || 0;
+  const shouldWriteDatabaseBackup = options.forceDatabaseBackup ||
+    !lastDatabaseBackupMs || Date.now() - lastDatabaseBackupMs >= DATABASE_BACKUP_INTERVAL_MS;
+  let databaseBackupFileId = account?.database_backup_file_id || null;
+  let databaseBackupUpdated = false;
+  if (shouldWriteDatabaseBackup) {
+    const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'routine-tracker-db-backup-'));
+    const tempPath = path.join(tempDir, 'routine-tracker.sqlite');
+    try {
+      await db.backup(tempPath);
+      if (!databaseBackupFileId) {
+        databaseBackupFileId = await findDriveFileByName(drive, 'Routine Tracker Database.sqlite');
+      }
+      const databaseBody = fs.createReadStream(tempPath);
+      if (databaseBackupFileId) {
+        await drive.files.update({
+          fileId: databaseBackupFileId,
+          media: { mimeType: 'application/vnd.sqlite3', body: databaseBody },
+          fields: 'id,name,modifiedTime'
+        });
+      } else {
+        const created = await drive.files.create({
+          requestBody: { name: 'Routine Tracker Database.sqlite', mimeType: 'application/vnd.sqlite3' },
+          media: { mimeType: 'application/vnd.sqlite3', body: databaseBody },
+          fields: 'id,name,modifiedTime'
+        });
+        databaseBackupFileId = created.data.id;
+      }
+      const backupAt = nowIso();
+      db.prepare(`UPDATE google_accounts SET database_backup_file_id=?,last_database_backup=?,
+        updated_at=? WHERE account_key=?`)
+        .run(databaseBackupFileId, backupAt, backupAt, accountKey);
+      databaseBackupUpdated = true;
+    } finally {
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  const syncedAt = nowIso();
+  db.prepare(`UPDATE google_accounts SET drive_file_id=?,last_drive_sync=?,last_error=NULL,updated_at=?
+    WHERE account_key=?`)
+    .run(fileId, syncedAt, syncedAt, accountKey);
+  return {
+    fileId,
+    databaseBackupFileId,
+    databaseBackupUpdated,
+    exportedAt: backup.exportedAt,
+    routineCount: routines.length,
+    completionCount: completions.length,
+    googleTaskMappingCount: googleTasks.length
+  };
 }
 
 async function readStream(stream) {
@@ -1251,37 +1430,82 @@ async function readStream(stream) {
   for await (const chunk of stream) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks).toString('utf8');
 }
-async function restoreDriveBackup(userId) {
+
+async function readSqliteBackupFromDrive(drive, fileId, accountKey) {
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'routine-tracker-db-restore-'));
+  const tempPath = path.join(tempDir, 'routine-tracker.sqlite');
+  let sourceDb = null;
+  try {
+    const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+    await pipeline(response.data, fs.createWriteStream(tempPath));
+    sourceDb = new Database(tempPath, { readonly: true, fileMustExist: true });
+    const sourceAccount = sourceDb.prepare('SELECT account_key,last_database_backup FROM google_accounts WHERE account_key=?')
+      .get(accountKey);
+    if (!sourceAccount) throw new Error('The SQLite backup belongs to a different Google account or is incomplete.');
+    const sourceUser = sourceDb.prepare('SELECT id FROM users WHERE google_account_key=?').get(accountKey);
+    if (!sourceUser) throw new Error('The SQLite backup does not contain this Google account\'s user data.');
+    const hasTable = (name) => Boolean(sourceDb.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name));
+    return {
+      product: 'Routine Tracker',
+      formatVersion: 2,
+      exportedAt: sourceAccount.last_database_backup || nowIso(),
+      routines: sourceDb.prepare('SELECT * FROM routines WHERE user_id=? ORDER BY created_at').all(sourceUser.id),
+      completions: sourceDb.prepare('SELECT * FROM completions WHERE user_id=? ORDER BY completed_at').all(sourceUser.id),
+      googleTasks: hasTable('google_tasks')
+        ? sourceDb.prepare('SELECT * FROM google_tasks WHERE account_key=? ORDER BY routine_id,slot_key').all(accountKey) : [],
+      taskSuppressions: hasTable('routine_task_suppressions')
+        ? sourceDb.prepare('SELECT * FROM routine_task_suppressions WHERE user_id=? ORDER BY routine_id,slot_key').all(sourceUser.id) : []
+    };
+  } finally {
+    if (sourceDb) sourceDb.close();
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function restoreDriveBackup(userId, options = {}) {
   const user = db.prepare('SELECT google_account_key FROM users WHERE id = ?').get(userId);
   if (!user || !user.google_account_key) throw new Error('Connect Google before restoring from Drive.');
   const accountKey = user.google_account_key;
   const drive = driveApi(accountKey);
-  const account = db.prepare('SELECT drive_file_id FROM google_accounts WHERE account_key = ?').get(accountKey);
-  let fileId = account && account.drive_file_id;
-  if (!fileId) {
-    const found = await drive.files.list({
-      q: "name = 'Routine Tracker Backup.json' and trashed = false",
-      spaces: 'drive', pageSize: 10, fields: 'files(id,name,modifiedTime)'
-    });
-    fileId = (found.data.files || [])[0]?.id || null;
+  const account = db.prepare(`SELECT drive_file_id,database_backup_file_id FROM google_accounts
+    WHERE account_key=?`).get(accountKey);
+  const databaseBackupFileId = account?.database_backup_file_id ||
+    await findDriveFileByName(drive, 'Routine Tracker Database.sqlite');
+  let fileId = account?.drive_file_id || null;
+  let backup = null;
+
+  if (databaseBackupFileId) {
+    backup = await readSqliteBackupFromDrive(drive, databaseBackupFileId, accountKey);
+  } else {
+    fileId = fileId || await findDriveFileByName(drive, 'Routine Tracker Backup.json');
+    if (fileId) {
+      const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+      backup = safeJsonParse(await readStream(response.data));
+    }
   }
-  if (!fileId) throw new Error('No Routine Tracker Backup.json file was found in this Google Drive.');
-  const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
-  const backup = safeJsonParse(await readStream(response.data));
-  if (!backup || backup.product !== 'Routine Tracker' || backup.formatVersion !== 1 || !Array.isArray(backup.routines) || !Array.isArray(backup.completions)) {
+
+  if (!backup) {
+    if (options.allowMissing) {
+      return { restored: false, routineCount: 0, completionCount: 0, googleTaskMappingCount: 0 };
+    }
+    throw new Error('No Routine Tracker SQLite or JSON backup was found in this Google Drive.');
+  }
+  if (backup.product !== 'Routine Tracker' ||
+      ![1, 2].includes(Number(backup.formatVersion)) ||
+      !Array.isArray(backup.routines) ||
+      !Array.isArray(backup.completions)) {
     throw new Error('The Drive file is not a supported Routine Tracker backup.');
   }
+
   let routineCount = 0;
   let completionCount = 0;
+  let googleTaskMappingCount = 0;
   const importTransaction = db.transaction(() => {
     const routineIdMap = new Map();
     for (const r of backup.routines) {
       if (!r || !r.id || !r.title || !['frequency', 'interval'].includes(r.type)) continue;
       const sourceId = String(r.id);
       const existing = db.prepare('SELECT user_id FROM routines WHERE id = ?').get(sourceId);
-      // Routine IDs are global in this SQLite schema. When restoring the same
-      // backup into a different Google profile, clone conflicting IDs instead
-      // of moving the original profile's routine into the new profile.
       const targetId = existing && existing.user_id !== userId ? makeId('routine') : sourceId;
       routineIdMap.set(sourceId, targetId);
       const values = {
@@ -1290,26 +1514,32 @@ async function restoreDriveBackup(userId) {
         period_value: r.period_value ?? null, period_unit: r.period_unit ?? null,
         interval_value: r.interval_value ?? null, interval_unit: r.interval_unit ?? null,
         start_at: r.start_at ?? null, last_completed_at: r.last_completed_at ?? null,
-        next_due_at: r.next_due_at ?? null, progressive: r.progressive ?? 1, linked_to_routine_id: r.linked_to_routine_id ?? null, linked_offset_days: r.linked_offset_days ?? -1, linked_completed_anchor: r.linked_completed_anchor ?? null, archived: r.archived ? 1 : 0,
+        next_due_at: r.next_due_at ?? null, progressive: r.progressive ?? 1,
+        linked_to_routine_id: r.linked_to_routine_id ?? null, linked_offset_days: r.linked_offset_days ?? -1,
+        linked_completed_anchor: r.linked_completed_anchor ?? null, archived: r.archived ? 1 : 0,
         created_at: r.created_at || nowIso(), updated_at: r.updated_at || nowIso()
       };
       if (existing && targetId === sourceId) {
         db.prepare(`UPDATE routines SET title=@title,notes=@notes,color=@color,icon_name=@icon_name,icon_color=@icon_color,type=@type,min_count=@min_count,
           max_count=@max_count,period_value=@period_value,period_unit=@period_unit,interval_value=@interval_value,
-          interval_unit=@interval_unit,start_at=@start_at,last_completed_at=@last_completed_at,next_due_at=@next_due_at,progressive=@progressive,linked_to_routine_id=@linked_to_routine_id,linked_offset_days=@linked_offset_days,linked_completed_anchor=@linked_completed_anchor,
+          interval_unit=@interval_unit,start_at=@start_at,last_completed_at=@last_completed_at,next_due_at=@next_due_at,progressive=@progressive,
+          linked_to_routine_id=@linked_to_routine_id,linked_offset_days=@linked_offset_days,linked_completed_anchor=@linked_completed_anchor,
           archived=@archived,updated_at=@updated_at WHERE id=@id AND user_id=@user_id AND updated_at < @updated_at`)
           .run(values);
       } else {
         db.prepare(`INSERT OR IGNORE INTO routines(
           id,user_id,title,notes,color,icon_name,icon_color,type,min_count,max_count,period_value,period_unit,
-          interval_value,interval_unit,start_at,last_completed_at,next_due_at,progressive,linked_to_routine_id,linked_offset_days,linked_completed_anchor,archived,created_at,updated_at
+          interval_value,interval_unit,start_at,last_completed_at,next_due_at,progressive,linked_to_routine_id,
+          linked_offset_days,linked_completed_anchor,archived,created_at,updated_at
         ) VALUES(
           @id,@user_id,@title,@notes,@color,@icon_name,@icon_color,@type,@min_count,@max_count,@period_value,@period_unit,
-          @interval_value,@interval_unit,@start_at,@last_completed_at,@next_due_at,@progressive,@linked_to_routine_id,@linked_offset_days,@linked_completed_anchor,@archived,@created_at,@updated_at
+          @interval_value,@interval_unit,@start_at,@last_completed_at,@next_due_at,@progressive,@linked_to_routine_id,
+          @linked_offset_days,@linked_completed_anchor,@archived,@created_at,@updated_at
         )`).run(values);
       }
       routineCount++;
     }
+
     for (const c of backup.completions) {
       if (!c || !c.id || !c.routine_id || !c.completed_at) continue;
       const targetRoutineId = routineIdMap.get(String(c.routine_id));
@@ -1320,14 +1550,62 @@ async function restoreDriveBackup(userId) {
         .run(targetCompletionId, targetRoutineId, userId, String(c.completed_at), String(c.note || ''));
       completionCount++;
     }
+
+    for (const mapping of (Array.isArray(backup.googleTasks) ? backup.googleTasks : [])) {
+      if (!mapping || !mapping.routine_id || !mapping.slot_key || !mapping.task_id) continue;
+      const targetRoutineId = routineIdMap.get(String(mapping.routine_id));
+      if (!targetRoutineId) continue;
+      const otherOwner = db.prepare('SELECT routine_id FROM google_tasks WHERE account_key=? AND task_id=?')
+        .get(accountKey, String(mapping.task_id));
+      if (otherOwner && otherOwner.routine_id !== targetRoutineId) continue;
+      const current = db.prepare('SELECT task_id,status FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=?')
+        .get(accountKey, targetRoutineId, String(mapping.slot_key));
+      if (current && current.task_id !== String(mapping.task_id) &&
+          !['deleted', 'completed'].includes(current.status)) continue;
+      db.prepare(`INSERT INTO google_tasks(
+        account_key,routine_id,slot_key,task_id,due_date,status,updated_at,completion_id,
+        remote_updated_at,legacy_probe_done,identity_marker_added
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(account_key,routine_id,slot_key) DO UPDATE SET
+        task_id=excluded.task_id,due_date=excluded.due_date,status=excluded.status,
+        updated_at=excluded.updated_at,completion_id=excluded.completion_id,
+        remote_updated_at=excluded.remote_updated_at,legacy_probe_done=excluded.legacy_probe_done,
+        identity_marker_added=excluded.identity_marker_added
+      WHERE excluded.updated_at >= google_tasks.updated_at OR google_tasks.status='deleted'`)
+        .run(accountKey, targetRoutineId, String(mapping.slot_key), String(mapping.task_id),
+          String(mapping.due_date || ''), ['needsAction', 'completed', 'deleted'].includes(mapping.status) ? mapping.status : 'needsAction',
+          mapping.updated_at || nowIso(), mapping.completion_id || null, mapping.remote_updated_at || null,
+          mapping.legacy_probe_done ? 1 : 0, mapping.identity_marker_added ? 1 : 0);
+      googleTaskMappingCount++;
+    }
+
+    for (const suppression of (Array.isArray(backup.taskSuppressions) ? backup.taskSuppressions : [])) {
+      if (!suppression || !suppression.routine_id || !suppression.slot_key) continue;
+      const targetRoutineId = routineIdMap.get(String(suppression.routine_id));
+      if (!targetRoutineId) continue;
+      db.prepare('INSERT OR IGNORE INTO routine_task_suppressions(user_id,routine_id,slot_key,created_at) VALUES(?,?,?,?)')
+        .run(userId, targetRoutineId, String(suppression.slot_key), suppression.created_at || nowIso());
+    }
   });
   importTransaction();
-  db.prepare('UPDATE google_accounts SET drive_file_id = ?, last_drive_sync = ?, last_error = NULL, updated_at = ? WHERE account_key = ?')
-    .run(fileId, nowIso(), nowIso(), accountKey);
-  queueDriveSync(userId);
-  return { routineCount, completionCount, backupExportedAt: backup.exportedAt || null };
-}
 
+  const syncedAt = nowIso();
+  db.prepare(`UPDATE google_accounts SET
+    drive_file_id=COALESCE(?,drive_file_id),
+    database_backup_file_id=COALESCE(?,database_backup_file_id),
+    last_drive_sync=?,last_error=NULL,updated_at=?
+    WHERE account_key=?`)
+    .run(fileId, databaseBackupFileId || null, syncedAt, syncedAt, accountKey);
+  queueDriveSync(userId);
+  return {
+    restored: true,
+    routineCount,
+    completionCount,
+    googleTaskMappingCount,
+    backupExportedAt: backup.exportedAt || null,
+    source: databaseBackupFileId ? 'sqlite' : 'json'
+  };
+}
 const calendarSyncLocks = new Set();
 async function syncCalendarForAccount(accountKey, attempt = 0) {
   if (calendarSyncLocks.has(accountKey)) return { skipped: true };
@@ -1494,7 +1772,7 @@ app.get('/auth/google', (req, res, next) => {
       scope: GOOGLE_SCOPES
     };
     if (req.session.oauthSwitch) options.prompt = 'select_account consent';
-    else if (req.query.reauthorize === '1') options.prompt = 'consent';
+    else if (req.query.reauthorize === '1' || !getCurrentGoogleAccount(req.userId)) options.prompt = 'consent';
     const authUrl = client.generateAuthUrl(options);
     req.session.save((error) => error ? next(error) : res.redirect(authUrl));
   } catch (error) { next(error); }
@@ -1550,11 +1828,26 @@ app.get('/auth/google/callback', async (req, res, next) => {
     }
     req.session.userId = canonicalUserId;
     req.session.googleAccountKey = accountKey;
-    req.session.save(async (saveError) => {
+    req.session.save((saveError) => {
       if (saveError) return next(saveError);
-      syncCalendarForAccount(accountKey).catch((error) => console.warn('Initial Calendar sync failed:', error.message));
-      queueDriveSync(canonicalUserId);
-      res.redirect('/?connected=1');
+      (async () => {
+        // A brand-new server has an empty SQLite file. Restore from this Google
+        // account's Drive before scheduling any upload, otherwise an empty first
+        // backup could replace the user's existing backup.
+        const localData = db.prepare(`SELECT
+          (SELECT COUNT(*) FROM routines WHERE user_id=?) AS routines,
+          (SELECT COUNT(*) FROM completions WHERE user_id=?) AS completions`)
+          .get(canonicalUserId, canonicalUserId);
+        if (!Number(localData.routines) && !Number(localData.completions)) {
+          await restoreDriveBackup(canonicalUserId, { allowMissing: true });
+        }
+        syncCalendarForAccount(accountKey).catch((error) => console.warn('Initial Calendar sync failed:', error.message));
+        queueDriveSync(canonicalUserId);
+        res.redirect('/?connected=1');
+      })().catch((error) => {
+        console.error('Initial Drive restore failed; existing Drive backup was left untouched:', error.message);
+        res.redirect('/?google_error=drive_restore_failed');
+      });
     });
   } catch (error) {
     console.error('Google OAuth callback failed:', error.message);
@@ -1930,7 +2223,7 @@ app.post('/api/google/unlink', (req, res) => {
 });
 app.post('/api/drive/sync', async (req, res) => {
   try {
-    const result = await syncDriveBackup(req.userId);
+    const result = await syncDriveBackup(req.userId, { forceDatabaseBackup: true });
     res.json({ ok: true, result, google: googleStatus(req.userId) });
   } catch (error) { res.status(502).json({ error: error.message }); }
 });
