@@ -1846,16 +1846,12 @@ app.get('/auth/google/callback', async (req, res, next) => {
     req.session.save((saveError) => {
       if (saveError) return next(saveError);
       (async () => {
-        // A brand-new server has an empty SQLite file. Restore from this Google
-        // account's Drive before scheduling any upload, otherwise an empty first
-        // backup could replace the user's existing backup.
-        const localData = db.prepare(`SELECT
-          (SELECT COUNT(*) FROM routines WHERE user_id=?) AS routines,
-          (SELECT COUNT(*) FROM completions WHERE user_id=?) AS completions`)
-          .get(canonicalUserId, canonicalUserId);
-        if (!Number(localData.routines) && !Number(localData.completions)) {
-          await restoreDriveBackup(canonicalUserId, { allowMissing: true });
-        }
+        // Merge the connected account's Drive backup before any local task
+        // publisher or Drive uploader runs. This is safe for a non-empty local
+        // workspace too: imports preserve local-only records and resolve routine
+        // conflicts using updated_at, while restoring Google Task IDs prevents
+        // a second server from creating duplicate tasks.
+        await restoreDriveBackup(canonicalUserId, { allowMissing: true });
         syncCalendarForAccount(accountKey).catch((error) => console.warn('Initial Calendar sync failed:', error.message));
         queueDriveSync(canonicalUserId);
         res.redirect('/?connected=1');
