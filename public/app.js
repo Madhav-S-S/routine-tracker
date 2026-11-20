@@ -27,6 +27,7 @@ let bootstrapLoadPromise = null;
 let historyLoadPromise = null;
 const calendarLoadPromises = new Map();
 const calendarDataCache = new Map();
+let calendarDataRevision = 0;
 const DATA_CACHE_TTL_MS = 30000;
 let historyCachedAt = 0;
 let historyHasLoaded = false;
@@ -380,6 +381,9 @@ async function api(path, options = {}) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`);
   if (!['GET', 'HEAD'].includes(method)) {
+    // Invalidate completed and in-flight calendar snapshots after any write.
+    // Revision keys prevent an older in-flight response from replacing fresh data.
+    calendarDataRevision += 1;
     calendarDataCache.clear();
     historyHasLoaded = false;
   }
@@ -487,8 +491,27 @@ function routineCard(routine) {
     </article>`;
 }
 function renderChecklist() {
+  const overdueDays = (routine) => {
+    if (routine.type === 'interval') return Math.max(0, -Number(routine.daysUntilDue || 0));
+    const unlockAt = Date.parse(routine.nextUnlockAt || routine.nextOpportunityAt || routine.periodStart || '');
+    return Number.isFinite(unlockAt) ? Math.max(0, Math.floor((Date.now() - unlockAt) / 86400000)) : 0;
+  };
+  const priority = (routine) => {
+    // Unmet frequency minimums come first. Overdue repeat-after routines follow,
+    // with the most overdue first; due-today items follow those. Minimum-met
+    // frequency routines remain visible but intentionally sit at the bottom.
+    if (routine.type === 'frequency' && !routine.minimumReached) return 0;
+    if (routine.type === 'interval') return routine.daysUntilDue < 0 ? 1 : 2;
+    return 3;
+  };
   const items = state.routines.filter((r) => !r.taskSuppressed && (r.type === 'frequency' ? r.checkinAvailable : r.isDue))
-    .sort((a, b) => (a.type === 'interval' ? 0 : 1) - (b.type === 'interval' ? 0 : 1) || (a.title || '').localeCompare(b.title || ''));
+    .sort((a, b) => {
+      const priorityDifference = priority(a) - priority(b);
+      if (priorityDifference) return priorityDifference;
+      const overdueDifference = overdueDays(b) - overdueDays(a);
+      if (overdueDifference) return overdueDifference;
+      return (a.title || '').localeCompare(b.title || '');
+    });
   $('#checklistCount').textContent = String(items.length);
   if (!items.length) {
     $('#checklistList').innerHTML = `<div class="checklist-empty"><div class="empty-check-icon">✓</div><div><strong>You're all caught up.</strong><small>No routines need your attention right now.</small></div></div>`;
@@ -570,7 +593,8 @@ function setPage(page) {
 function loadCalendar(options = {}) {
   const month = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
   const forceTaskRefresh = options.forceTaskRefresh === true;
-  const requestKey = `${month}${forceTaskRefresh ? ':force-tasks' : ''}`;
+  const requestRevision = calendarDataRevision;
+  const requestKey = `${month}:${requestRevision}${forceTaskRefresh ? ':force-tasks' : ''}`;
   if (calendarLoadPromises.has(requestKey)) return calendarLoadPromises.get(requestKey);
   const cachedEntry = calendarDataCache.get(month);
   if (cachedEntry) {
@@ -592,10 +616,12 @@ function loadCalendar(options = {}) {
   const request = (async () => {
     try {
       const data = await api(`/api/calendar?month=${encodeURIComponent(month)}${forceTaskRefresh ? '&refreshTasks=1' : ''}`);
-      calendarDataCache.set(month, { data, cachedAt: Date.now() });
-      while (calendarDataCache.size > 4) calendarDataCache.delete(calendarDataCache.keys().next().value);
+      if (requestRevision === calendarDataRevision) {
+        calendarDataCache.set(month, { data, cachedAt: Date.now() });
+        while (calendarDataCache.size > 4) calendarDataCache.delete(calendarDataCache.keys().next().value);
+      }
       const currentMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
-      if (currentMonth !== month) return data;
+      if (requestRevision !== calendarDataRevision || currentMonth !== month) return data;
       state.calendarEvents = data.events || [];
       state.calendarWarning = data.syncWarning;
       if (state.selectedCalendarDate && !state.selectedCalendarDate.startsWith(month)) state.selectedCalendarDate = null;
@@ -608,7 +634,7 @@ function loadCalendar(options = {}) {
       return data;
     } catch (error) {
       const currentMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
-      if (currentMonth === month && !cachedEntry) $('#calendarGrid').innerHTML = `<div class="calendar-empty">${escapeHtml(error.message)}</div>`;
+      if (requestRevision === calendarDataRevision && currentMonth === month && !cachedEntry) $('#calendarGrid').innerHTML = `<div class="calendar-empty">${escapeHtml(error.message)}</div>`;
       return cachedEntry?.data || null;
     }
   })();
@@ -1281,8 +1307,9 @@ function installHandlers() {
   $('#googleUnlinkButton').addEventListener('click', unlinkGoogle);
   $('#googleSwitchButton').addEventListener('click', () => { window.location.href = '/auth/google?switch=1'; });
   $('#mobileMenuButton')?.addEventListener('click', () => { const open = $('#sidebar').classList.toggle('open'); $('#mobileMenuButton').setAttribute('aria-expanded', String(open)); });
-  $('#mobileProfileButton')?.addEventListener('click', () => setPage('settings'));
-  $('#sidebarProfile')?.addEventListener('click', () => setPage('settings'));
+  const toggleProfileSettings = () => setPage(state.activePage === 'settings' ? settingsReturnPage : 'settings');
+  $('#mobileProfileButton')?.addEventListener('click', toggleProfileSettings);
+  $('#sidebarProfile')?.addEventListener('click', toggleProfileSettings);
   const handleCalendarSelection = (event) => {
     const completeButton = event.target.closest('[data-calendar-day-complete]');
     if (completeButton) {
