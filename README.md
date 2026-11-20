@@ -25,7 +25,14 @@ The session cookie is configured for one year and rolls forward as the browser r
 
 ### Google Drive
 
-The app writes a visible file called **Routine Tracker Backup.json** in the connected user's My Drive. It contains routine definitions and completion history. Changes are backed up automatically after a short pause, and the Settings page also has manual **Sync to Drive** and **Restore from Drive** controls. Restore merges records and does not delete the current data.
+The app keeps two backup files in the connected user's My Drive:
+
+- **Routine Tracker Backup.json** — a portable export containing routine definitions, completion history, Google Tasks ID mappings, and task-deletion suppressions.
+- **Routine Tracker Database.sqlite** — a transactionally consistent SQLite snapshot containing the complete local database, including sessions, encrypted Google account tokens, sync cursors, and remote-task mappings.
+
+The JSON export is updated automatically after changes. The full SQLite snapshot is refreshed at least every five minutes and whenever the user manually selects **Sync to Drive**. A newly connected server restores the latest available Drive backup before it starts publishing Google Tasks or uploading a new backup. Restore merges routines and history, and reattaches the saved Google Task IDs so a second installation can recognize tasks already created by the first installation.
+
+Keep the `.env` file safe. In particular, `TOKEN_ENCRYPTION_KEY` is required to decrypt Google tokens in a restored SQLite database. The SQLite backup is sensitive and should remain in the connected user's private Drive.
 
 The integration requests Google's `drive.file` scope, which limits app access to files created/opened by this app. It does not request unrestricted access to the user's entire Drive.
 
