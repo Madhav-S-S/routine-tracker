@@ -34,6 +34,8 @@ The JSON export is updated automatically after changes. The full SQLite snapshot
 
 Keep the `.env` file safe. In particular, `TOKEN_ENCRYPTION_KEY` is required to decrypt Google tokens in a restored SQLite database. The SQLite backup is sensitive and should remain in the connected user's private Drive.
 
+For a one-time recovery from an installation whose local SQLite file is known to be authoritative, set `DRIVE_RESTORE_ON_STARTUP=false` on that server before starting it. This bypasses the startup import only for that process, allowing its local task mappings to be backed up first. Remove the setting (or set it back to `true`) after the recovery backup; normal servers should use the default `true` so Drive is restored before task sync starts.
+
 The integration requests Google's `drive.file` scope, which limits app access to files created/opened by this app. It does not request unrestricted access to the user's entire Drive.
 
 ### Google Calendar
