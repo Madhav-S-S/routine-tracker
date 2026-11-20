@@ -34,7 +34,7 @@ const DATABASE_BACKUP_INTERVAL_MS = Math.max(60000, Number(process.env.DATABASE_
 // occurrence; configure APP_TIME_ZONE if the server owner uses another zone.
 const APP_TIME_ZONE = process.env.APP_TIME_ZONE || 'Asia/Kolkata';
 const SESSION_MAX_AGE = 1000 * 60 * 60 * 24 * 365;
-const APP_VERSION = '1.8.0';
+const APP_VERSION = '1.9.0';
 
 if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.includes('replace-with')) {
   throw new Error('Set SESSION_SECRET in your .env file before starting the app.');
@@ -199,6 +199,7 @@ db.exec(`
 `);
 ensureColumn('routines', 'icon_name', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('routines', 'icon_color', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('routines', 'icon_background', "TEXT NOT NULL DEFAULT ''");
 
 function nowIso() { return new Date().toISOString(); }
 function makeId(prefix = 'r') { return `${prefix}_${crypto.randomUUID()}`; }
@@ -1535,7 +1536,7 @@ async function restoreDriveBackup(userId, options = {}) {
       routineIdMap.set(sourceId, targetId);
       const values = {
         id: targetId, user_id: userId, title: String(r.title).slice(0, 120), notes: String(r.notes || ''),
-        color: r.color || 'lavender', icon_name: r.icon_name || '', icon_color: r.icon_color || '', type: r.type, min_count: r.min_count ?? null, max_count: r.max_count ?? null,
+        color: r.color || 'lavender', icon_name: r.icon_name || '', icon_color: r.icon_color || '', icon_background: r.icon_background || '', type: r.type, min_count: r.min_count ?? null, max_count: r.max_count ?? null,
         period_value: r.period_value ?? null, period_unit: r.period_unit ?? null,
         interval_value: r.interval_value ?? null, interval_unit: r.interval_unit ?? null,
         start_at: r.start_at ?? null, last_completed_at: r.last_completed_at ?? null,
@@ -1545,7 +1546,7 @@ async function restoreDriveBackup(userId, options = {}) {
         created_at: r.created_at || nowIso(), updated_at: r.updated_at || nowIso()
       };
       if (existing && targetId === sourceId) {
-        db.prepare(`UPDATE routines SET title=@title,notes=@notes,color=@color,icon_name=@icon_name,icon_color=@icon_color,type=@type,min_count=@min_count,
+        db.prepare(`UPDATE routines SET title=@title,notes=@notes,color=@color,icon_name=@icon_name,icon_color=@icon_color,icon_background=@icon_background,type=@type,min_count=@min_count,
           max_count=@max_count,period_value=@period_value,period_unit=@period_unit,interval_value=@interval_value,
           interval_unit=@interval_unit,start_at=@start_at,last_completed_at=@last_completed_at,next_due_at=@next_due_at,progressive=@progressive,
           linked_to_routine_id=@linked_to_routine_id,linked_offset_days=@linked_offset_days,linked_completed_anchor=@linked_completed_anchor,
@@ -1553,11 +1554,11 @@ async function restoreDriveBackup(userId, options = {}) {
           .run(values);
       } else {
         db.prepare(`INSERT OR IGNORE INTO routines(
-          id,user_id,title,notes,color,icon_name,icon_color,type,min_count,max_count,period_value,period_unit,
+          id,user_id,title,notes,color,icon_name,icon_color,icon_background,type,min_count,max_count,period_value,period_unit,
           interval_value,interval_unit,start_at,last_completed_at,next_due_at,progressive,linked_to_routine_id,
           linked_offset_days,linked_completed_anchor,archived,created_at,updated_at
         ) VALUES(
-          @id,@user_id,@title,@notes,@color,@icon_name,@icon_color,@type,@min_count,@max_count,@period_value,@period_unit,
+          @id,@user_id,@title,@notes,@color,@icon_name,@icon_color,@icon_background,@type,@min_count,@max_count,@period_value,@period_unit,
           @interval_value,@interval_unit,@start_at,@last_completed_at,@next_due_at,@progressive,@linked_to_routine_id,
           @linked_offset_days,@linked_completed_anchor,@archived,@created_at,@updated_at
         )`).run(values);
@@ -1744,7 +1745,12 @@ function parseRoutineBody(body, existing = null) {
   const rawIcon = String(body.iconName ?? existing?.icon_name ?? 'sparkles').trim().toLowerCase();
   const iconName = ROUTINE_ICON_NAMES.has(rawIcon) ? rawIcon : 'sparkles';
   const iconColor = /^#[0-9a-f]{3,6}$/i.test(color) ? normalizeHexColor(color) : (ROUTINE_COLOR_HEX[color] || '#a895f0');
-  const common = { title, notes: String(body.notes ?? existing?.notes ?? '').trim().slice(0, 1200), color, icon_name: iconName, icon_color: iconColor, type };
+  const hasIconBackground = Object.prototype.hasOwnProperty.call(body, 'iconBackground');
+  const rawIconBackground = hasIconBackground ? body.iconBackground : existing?.icon_background;
+  const iconBackgroundText = String(rawIconBackground || '').trim();
+  if (iconBackgroundText && !/^#[0-9a-f]{3}(?:[0-9a-f]{3})?$/i.test(iconBackgroundText)) throw new Error('Choose a valid icon background color.');
+  const iconBackground = iconBackgroundText ? normalizeHexColor(iconBackgroundText, '') : '';
+  const common = { title, notes: String(body.notes ?? existing?.notes ?? '').trim().slice(0, 1200), color, icon_name: iconName, icon_color: iconColor, icon_background: iconBackground, type };
 
   const hasLinkedValue = Object.prototype.hasOwnProperty.call(body, 'linkedToRoutineId');
   const linkedId = hasLinkedValue ? (body.linkedToRoutineId ? String(body.linkedToRoutineId) : null) : (existing?.linked_to_routine_id || null);
@@ -1914,10 +1920,10 @@ app.post('/api/routines', (req, res) => {
     const id = makeId('routine');
     const stamp = nowIso();
     db.prepare(`INSERT INTO routines(
-      id,user_id,title,notes,color,icon_name,icon_color,type,min_count,max_count,period_value,period_unit,
+      id,user_id,title,notes,color,icon_name,icon_color,icon_background,type,min_count,max_count,period_value,period_unit,
       interval_value,interval_unit,start_at,last_completed_at,next_due_at,progressive,linked_to_routine_id,linked_offset_days,linked_completed_anchor,created_at,updated_at
     ) VALUES(
-      @id,@user_id,@title,@notes,@color,@icon_name,@icon_color,@type,@min_count,@max_count,@period_value,@period_unit,
+      @id,@user_id,@title,@notes,@color,@icon_name,@icon_color,@icon_background,@type,@min_count,@max_count,@period_value,@period_unit,
       @interval_value,@interval_unit,@start_at,@last_completed_at,@next_due_at,@progressive,@linked_to_routine_id,@linked_offset_days,@linked_completed_anchor,@created_at,@updated_at
     )`).run({ id, user_id: req.userId, ...data, created_at: stamp, updated_at: stamp });
     if (!data.linked_to_routine_id) updateLinkedRoutineSchedules(req.userId, id);
@@ -1931,7 +1937,7 @@ app.patch('/api/routines/:id', (req, res) => {
     const existing = db.prepare('SELECT * FROM routines WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
     if (!existing) return res.status(404).json({ error: 'Routine not found.' });
     const data = parseRoutineBody({ ...req.body, type: existing.type, userId: req.userId }, existing);
-    db.prepare(`UPDATE routines SET title=@title,notes=@notes,color=@color,icon_name=@icon_name,icon_color=@icon_color,min_count=@min_count,max_count=@max_count,
+    db.prepare(`UPDATE routines SET title=@title,notes=@notes,color=@color,icon_name=@icon_name,icon_color=@icon_color,icon_background=@icon_background,min_count=@min_count,max_count=@max_count,
       period_value=@period_value,period_unit=@period_unit,interval_value=@interval_value,interval_unit=@interval_unit,
       start_at=@start_at,last_completed_at=@last_completed_at,next_due_at=@next_due_at,progressive=@progressive,linked_to_routine_id=@linked_to_routine_id,linked_offset_days=@linked_offset_days,linked_completed_anchor=@linked_completed_anchor,updated_at=@updated_at
       WHERE id=@id AND user_id=@user_id`).run({ ...data, updated_at: nowIso(), id: existing.id, user_id: req.userId });
