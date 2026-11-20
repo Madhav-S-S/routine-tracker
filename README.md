@@ -30,7 +30,7 @@ The app keeps two backup files in the connected user's My Drive:
 - **Routine Tracker Backup.json** — a portable export containing routine definitions, completion history, Google Tasks ID mappings, and task-deletion suppressions.
 - **Routine Tracker Database.sqlite** — a transactionally consistent SQLite snapshot containing the complete local database, including sessions, encrypted Google account tokens, sync cursors, and remote-task mappings.
 
-The JSON export is updated automatically after changes. The full SQLite snapshot is refreshed at least every five minutes and whenever the user manually selects **Sync to Drive**. A newly connected server restores the latest available Drive backup before it starts publishing Google Tasks or uploading a new backup. Restore merges routines and history, and reattaches the saved Google Task IDs so a second installation can recognize tasks already created by the first installation.
+The JSON export is updated automatically after changes. The full SQLite snapshot is refreshed at least every five minutes and whenever the user manually selects **Sync to Drive**. Each server restores the latest available Drive backup on startup and after a new Google connection, before it is allowed to publish Google Tasks or upload another backup. Restore merges routines and history, reattaches the saved Google Task IDs, and removes a different pending task only when the local database maps it to the exact same routine occurrence as the Drive backup.
 
 Keep the `.env` file safe. In particular, `TOKEN_ENCRYPTION_KEY` is required to decrypt Google tokens in a restored SQLite database. The SQLite backup is sensitive and should remain in the connected user's private Drive.
 
