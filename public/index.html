@@ -3,20 +3,28 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-  <meta name="theme-color" content="#111713">
+  <meta name="theme-color" content="#171621">
   <meta name="description" content="A calm, thoughtful space to keep your routines moving.">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Routine">
+  <link rel="manifest" href="/manifest.webmanifest">
   <title>Routine — Make room for what matters</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="apple-touch-icon" href="/favicon.svg">
-  <link rel="stylesheet" href="/styles.css?v=20261120-mobile-fix">
+  <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="/styles.css?v=20261120-pwa-colors">
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar" id="sidebar">
-      <a class="brand" href="#dashboard" aria-label="routine. by Madhav home">
-        <span class="brand-mark"><span></span><span></span><span></span></span>
-        <span class="brand-copy"><span class="brand-name">routine<span class="brand-period">.</span></span><small class="brand-byline">by Madhav</small></span>
-      </a>
+      <div class="brand-row sidebar-brand-row">
+        <button class="brand-back-button" id="sidebarSettingsBack" type="button" aria-label="Back from settings" title="Back">←</button>
+        <a class="brand" href="#dashboard" aria-label="routine. by Madhav home">
+          <span class="brand-mark"><span></span><span></span><span></span></span>
+          <span class="brand-copy"><span class="brand-name">routine<span class="brand-period">.</span></span><small class="brand-byline">by Madhav</small></span>
+        </a>
+      </div>
 
       <nav class="main-nav" aria-label="Main navigation">
         <button class="nav-item active" data-page="dashboard"><span class="nav-icon dashboard-nav-icon" aria-hidden="true">✓</span><span>Dashboard</span><span class="nav-indicator"></span></button>
@@ -36,10 +44,13 @@
     <main class="main-content">
       <header class="topbar">
         <button class="icon-button mobile-menu" id="mobileMenuButton" aria-label="Open navigation menu" aria-controls="sidebar" aria-expanded="false">☰</button>
-        <a class="brand mobile-topbar-brand" href="#dashboard" aria-label="routine. by Madhav home">
-          <span class="brand-mark"><span></span><span></span><span></span></span>
-          <span class="brand-copy"><span class="brand-name">routine<span class="brand-period">.</span></span><small class="brand-byline">by Madhav</small></span>
-        </a>
+        <div class="brand-row topbar-brand-row">
+          <button class="brand-back-button" id="topbarSettingsBack" type="button" aria-label="Back from settings" title="Back">←</button>
+          <a class="brand mobile-topbar-brand" href="#dashboard" aria-label="routine. by Madhav home">
+            <span class="brand-mark"><span></span><span></span><span></span></span>
+            <span class="brand-copy"><span class="brand-name">routine<span class="brand-period">.</span></span><small class="brand-byline">by Madhav</small></span>
+          </a>
+        </div>
         <button class="mobile-profile-button" id="mobileProfileButton" type="button" aria-label="Open profile settings">
           <span class="top-avatar" id="mobileHeaderAvatar">Y</span>
         </button>
@@ -247,6 +258,6 @@
   </nav>
 
   <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20261120-mobile-fix" defer></script>
+  <script src="/app.js?v=20261120-pwa-colors" defer></script>
 </body>
 </html>
