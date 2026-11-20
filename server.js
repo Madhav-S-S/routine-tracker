@@ -33,6 +33,13 @@ const DATABASE_BACKUP_INTERVAL_MS = Math.max(60000, Number(process.env.DATABASE_
 // as UTC instants. Use the user's local calendar date when computing the next
 // occurrence; configure APP_TIME_ZONE if the server owner uses another zone.
 const APP_TIME_ZONE = process.env.APP_TIME_ZONE || 'Asia/Kolkata';
+const ROUTINE_DATE_FORMATTER = new Intl.DateTimeFormat('en-CA', {
+  timeZone: APP_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit'
+});
+const ROUTINE_DATE_TIME_FORMATTER = new Intl.DateTimeFormat('en-CA', {
+  timeZone: APP_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+});
 const SESSION_MAX_AGE = 1000 * 60 * 60 * 24 * 365;
 const APP_VERSION = '1.9.0';
 
@@ -282,30 +289,37 @@ function updateLinkedRoutineSchedules(userId, sourceRoutineId) {
 }
 
 function getCurrentPeriod(routine, now = new Date()) {
-  const anchor = new Date(routine.start_at || routine.created_at);
+  // start_at is stored as a UTC date key, not a UTC instant. Calculate the
+  // current period using the user's local calendar day so a period rolls over
+  // at local midnight rather than several hours into the morning.
+  const anchorKey = routine.start_at
+    ? String(routine.start_at).slice(0, 10)
+    : routineDateOnly(routine.created_at);
+  const anchor = new Date(`${anchorKey}T00:00:00.000Z`);
+  const today = new Date(`${routineDateOnly(now)}T00:00:00.000Z`);
   const amount = Number(routine.period_value || 1);
   const unit = routine.period_unit || 'weeks';
-  if (now <= anchor) return { start: anchor, end: addInterval(anchor, amount, unit) };
+  if (today < anchor) return { start: anchor, end: addInterval(anchor, amount, unit) };
   let index = 0;
   if (unit === 'days' || unit === 'weeks') {
     const stepMs = amount * (unit === 'weeks' ? 7 : 1) * 86400000;
-    index = Math.max(0, Math.floor((now.getTime() - anchor.getTime()) / stepMs));
+    index = Math.max(0, Math.floor((today.getTime() - anchor.getTime()) / stepMs));
   } else if (unit === 'months') {
-    const monthDifference = (now.getUTCFullYear() - anchor.getUTCFullYear()) * 12 + now.getUTCMonth() - anchor.getUTCMonth();
+    const monthDifference = (today.getUTCFullYear() - anchor.getUTCFullYear()) * 12 + today.getUTCMonth() - anchor.getUTCMonth();
     index = Math.max(0, Math.floor(monthDifference / amount));
   } else {
-    const yearDifference = now.getUTCFullYear() - anchor.getUTCFullYear();
+    const yearDifference = today.getUTCFullYear() - anchor.getUTCFullYear();
     index = Math.max(0, Math.floor(yearDifference / amount));
   }
-  // Always derive each boundary from the original anchor. This avoids date drift
-  // for month-end starts (for example Jan 31 -> Feb 28 -> Mar 31).
+  // Keep arithmetic on date keys. Convert boundaries to local-midnight
+  // timestamps only when comparing them with real completion timestamps.
   let start = addInterval(anchor, index * amount, unit);
-  while (start > now && index > 0) {
+  while (start > today && index > 0) {
     index--;
     start = addInterval(anchor, index * amount, unit);
   }
   let end = addInterval(anchor, (index + 1) * amount, unit);
-  while (end <= now) {
+  while (end <= today) {
     index++;
     start = end;
     end = addInterval(anchor, (index + 1) * amount, unit);
@@ -318,13 +332,14 @@ function getRoutineAnchorDate(routine, now = new Date()) {
   if (routine.type === 'interval') return routine.next_due_at ? new Date(routine.next_due_at) : null;
   if (routine.type !== 'frequency') return null;
   const window = getCurrentPeriod(routine, now);
+  const bounds = routinePeriodInstants(window);
   const count = db.prepare(`SELECT COUNT(*) AS n FROM completions WHERE routine_id=? AND completed_at>=? AND completed_at<?`)
-    .get(routine.id, window.start.toISOString(), window.end.toISOString()).n;
+    .get(routine.id, bounds.start.toISOString(), bounds.end.toISOString()).n;
   const maxCount = Math.max(1, Number(routine.max_count || 1));
-  if (Number(count || 0) >= maxCount) return window.end;
-  if (!parseBooleanFlag(routine.progressive, true)) return window.start;
-  const duration = Math.max(1, window.end.getTime() - window.start.getTime());
-  return new Date(window.start.getTime() + duration * (Number(count || 0) / maxCount));
+  if (Number(count || 0) >= maxCount) return bounds.end;
+  if (!parseBooleanFlag(routine.progressive, true)) return bounds.start;
+  const duration = Math.max(1, bounds.end.getTime() - bounds.start.getTime());
+  return new Date(bounds.start.getTime() + duration * (Number(count || 0) / maxCount));
 }
 
 function unitLabel(unit, plural = true) {
@@ -509,11 +524,30 @@ function routineDateOnly(value) {
   if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) throw new Error('A valid completion date is required.');
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: APP_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit'
-  }).formatToParts(date);
+  const parts = ROUTINE_DATE_FORMATTER.formatToParts(date);
   const part = (type) => parts.find((item) => item.type === type)?.value;
   return `${part('year')}-${part('month')}-${part('day')}`;
+}
+function routineLocalMidnight(dateLike) {
+  const key = dateLike instanceof Date ? dateLike.toISOString().slice(0, 10) : String(dateLike || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) throw new Error('A valid routine period date is required.');
+  const [year, month, day] = key.split('-').map(Number);
+  const targetWallTime = Date.UTC(year, month - 1, day);
+  let guess = targetWallTime;
+  // Resolve local midnight to UTC with a small fixed number of Intl operations.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const parts = ROUTINE_DATE_TIME_FORMATTER.formatToParts(new Date(guess));
+    const value = (type) => Number(parts.find((part) => part.type === type)?.value || 0);
+    const wallClockAsUtc = Date.UTC(value('year'), value('month') - 1, value('day'),
+      value('hour'), value('minute'), value('second'));
+    const corrected = guess + targetWallTime - wallClockAsUtc;
+    if (corrected === guess) break;
+    guess = corrected;
+  }
+  return new Date(guess);
+}
+function routinePeriodInstants(period) {
+  return { start: routineLocalMidnight(period.start), end: routineLocalMidnight(period.end) };
 }
 function routineDateAnchor(value) {
   return new Date(`${routineDateOnly(value)}T00:00:00.000Z`);
@@ -598,9 +632,10 @@ function recalculateRoutineAfterGoogleTaskChange(userId, routineId) {
   const refreshed = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=?').get(routineId, userId);
   if (refreshed?.type === 'frequency' && refreshed.linked_to_routine_id) {
     const period = getCurrentPeriod(refreshed);
+    const bounds = routinePeriodInstants(period);
     const count = db.prepare(`SELECT COUNT(*) AS n FROM completions
       WHERE routine_id=? AND completed_at>=? AND completed_at<?`)
-      .get(routineId, period.start.toISOString(), period.end.toISOString()).n;
+      .get(routineId, bounds.start.toISOString(), bounds.end.toISOString()).n;
     if (Number(count) < Number(refreshed.max_count || 1) && refreshed.linked_completed_anchor) {
       db.prepare('UPDATE routines SET linked_completed_anchor=NULL,updated_at=? WHERE id=? AND user_id=?')
         .run(nowIso(), routineId, userId);
@@ -1032,7 +1067,8 @@ async function syncRoutineTasks(userId, routineIds = null, options = {}) {
         dueDate = isoDateOnly(routine.next_due_at);
         slotKey = routineTaskSlotKey(routine);
       } else if (routine.type === 'frequency' && routine.checkinAvailable) {
-        dueDate = isoDateOnly(nowIso());
+        // Publish against the fixed slot date, not the day a background sync runs.
+        dueDate = routineDateOnly(routine.nextOpportunityAt || nowIso());
         slotKey = routineTaskSlotKey(routine);
       }
       if (!dueDate || !slotKey) continue;
@@ -1212,25 +1248,26 @@ function publicRoutine(routine, now = new Date(), context = null) {
   const item = { ...routine, archived: Boolean(routine.archived), progressive };
   if (routine.type === 'frequency') {
     const window = context?.periods.get(routine.id) || getCurrentPeriod(routine, now);
+    const bounds = routinePeriodInstants(window);
     const count = context?.completionCounts.has(routine.id)
       ? context.completionCounts.get(routine.id)
       : db.prepare(`SELECT COUNT(*) AS n FROM completions
           WHERE routine_id = ? AND completed_at >= ? AND completed_at < ?`)
-          .get(routine.id, window.start.toISOString(), window.end.toISOString()).n;
-    const duration = Math.max(1, window.end.getTime() - window.start.getTime());
-    const hasStarted = now.getTime() >= window.start.getTime();
-    const elapsedFraction = Math.max(0, Math.min(1, (now.getTime() - window.start.getTime()) / duration));
+          .get(routine.id, bounds.start.toISOString(), bounds.end.toISOString()).n;
+    const duration = Math.max(1, bounds.end.getTime() - bounds.start.getTime());
+    const hasStarted = now.getTime() >= bounds.start.getTime();
+    const elapsedFraction = Math.max(0, Math.min(1, (now.getTime() - bounds.start.getTime()) / duration));
     const maxCount = Math.max(1, Number(routine.max_count || 1));
     const completedCount = Math.min(maxCount, Number(count || 0));
 
-    // Progressive is a visibility schedule only. It determines when the next
-    // checklist/Calendar/Google Task item appears; it does not prohibit a user
-    // from manually logging an early completion from the routine card.
+    // One period has exactly max_count evenly spaced slots: at the start,
+    // then at 1/max_count, 2/max_count, and so on through the period.
+    // Keep the pending slot on its scheduled date even after it unlocks.
     const frequencyUnlock = completedCount >= maxCount
       ? null
       : progressive
-        ? new Date(window.start.getTime() + duration * (completedCount / maxCount))
-        : window.start;
+        ? new Date(bounds.start.getTime() + duration * (completedCount / maxCount))
+        : bounds.start;
     const linkedDue = routine.linked_to_routine_id && routine.next_due_at ? new Date(routine.next_due_at) : null;
     const linkedDoneForThisAnchor = Boolean(routine.linked_to_routine_id && routine.linked_completed_anchor && routine.next_due_at && routine.linked_completed_anchor === routine.next_due_at);
     const nextUnlock = completedCount >= maxCount || linkedDoneForThisAnchor
@@ -1239,10 +1276,8 @@ function publicRoutine(routine, now = new Date(), context = null) {
         ? new Date(Math.max(frequencyUnlock.getTime(), linkedDue.getTime()))
         : frequencyUnlock;
     const linkedReady = !routine.linked_to_routine_id || (linkedDue && now.getTime() >= linkedDue.getTime() && !linkedDoneForThisAnchor);
-    const checkinAvailable = completedCount < maxCount && hasStarted && linkedReady && (!progressive || now.getTime() >= frequencyUnlock.getTime());
-    const nextOpportunityAt = completedCount >= maxCount || linkedDoneForThisAnchor
-      ? null
-      : (checkinAvailable ? now.toISOString() : (nextUnlock ? nextUnlock.toISOString() : null));
+    const checkinAvailable = completedCount < maxCount && hasStarted && linkedReady && Boolean(nextUnlock) && now.getTime() >= nextUnlock.getTime();
+    const nextOpportunityAt = nextUnlock ? nextUnlock.toISOString() : null;
 
     item.periodStart = window.start.toISOString();
     item.periodEnd = window.end.toISOString();
@@ -1300,7 +1335,8 @@ function listRoutines(userId, includeArchived = false) {
   const frequencyRows = rows.filter((row) => row.type === 'frequency').map((routine) => {
     const window = getCurrentPeriod(routine, now);
     periods.set(routine.id, window);
-    return { routine, window };
+    const bounds = routinePeriodInstants(window);
+    return { routine, window, bounds };
   });
 
   // Batch current-period counts through indexed joins instead of a query
@@ -1308,8 +1344,8 @@ function listRoutines(userId, includeArchived = false) {
   for (let offset = 0; offset < frequencyRows.length; offset += 200) {
     const chunk = frequencyRows.slice(offset, offset + 200);
     const slots = chunk.map(() => '(?,?,?)').join(',');
-    const params = chunk.flatMap(({ routine, window }) => [
-      routine.id, window.start.toISOString(), window.end.toISOString()
+    const params = chunk.flatMap(({ routine, bounds }) => [
+      routine.id, bounds.start.toISOString(), bounds.end.toISOString()
     ]);
     const counts = db.prepare(`WITH period_bounds(routine_id, period_start, period_end) AS (VALUES ${slots})
       SELECT p.routine_id, COUNT(c.id) AS completion_count
@@ -2047,25 +2083,37 @@ app.delete('/api/routines/:id', async (req, res) => {
     const linkedTasks = account
       ? db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status<>'deleted'").all(account.account_key, routine.id)
       : [];
-    // Archive only after every Google Task has been removed successfully.
+    // Delete remote tasks first. If Google rejects a deletion, leave the
+    // routine and its local history untouched so the two systems stay aligned.
     if (account) {
       for (const task of linkedTasks) {
         try { await deleteGoogleTask(account.account_key, task.task_id); }
         catch (error) {
-          console.warn('Could not delete Google Task while archiving routine:', error.message);
-          return res.status(502).json({ error: 'The routine was not archived because Google could not delete one of its tasks. Reconnect Google Tasks and try again.' });
+          console.warn('Could not delete Google Task while deleting routine:', error.message);
+          return res.status(502).json({ error: 'The routine was not deleted because Google could not delete one of its tasks. Reconnect Google Tasks and try again.' });
         }
       }
-      db.prepare("UPDATE google_tasks SET status='deleted',updated_at=? WHERE account_key=? AND routine_id=?")
-        .run(nowIso(), account.account_key, routine.id);
     }
-    db.prepare('UPDATE routines SET archived=1,updated_at=? WHERE id=? AND user_id=?').run(nowIso(), routine.id, req.userId);
+    const stamp = nowIso();
+    const deleteRoutineData = db.transaction(() => {
+      db.prepare('DELETE FROM completions WHERE user_id=? AND routine_id=?').run(req.userId, routine.id);
+      db.prepare('DELETE FROM routine_task_suppressions WHERE user_id=? AND routine_id=?').run(req.userId, routine.id);
+      if (account) {
+        db.prepare("UPDATE google_tasks SET status='deleted',completion_id=NULL,updated_at=? WHERE account_key=? AND routine_id=?")
+          .run(stamp, account.account_key, routine.id);
+      }
+      // Retain an archived definition for conflict-safe Drive sync, while
+      // removing every completion so this routine disappears from Activity.
+      db.prepare('UPDATE routines SET archived=1,updated_at=? WHERE id=? AND user_id=?')
+        .run(stamp, routine.id, req.userId);
+    });
+    deleteRoutineData();
     updateLinkedRoutineSchedules(req.userId, routine.id);
     queueDriveSync(req.userId);
     res.json({ ok: true, deletedGoogleTasks: linkedTasks.length });
   } catch (error) {
-    console.error('Routine archive failed:', error.message);
-    res.status(500).json({ error: 'Could not archive this routine.' });
+    console.error('Routine deletion failed:', error.message);
+    res.status(500).json({ error: 'Could not delete this routine.' });
   }
 });
 app.post('/api/routines/:id/complete', async (req, res) => {
@@ -2150,8 +2198,10 @@ app.delete('/api/history/:id', async (req, res) => {
     db.prepare('UPDATE routines SET last_completed_at=?,updated_at=? WHERE id=?').run(latest?.completed_at || null, nowIso(), routine.id);
   }
   if (routine && routine.type === 'frequency') {
+    const currentPeriod = getCurrentPeriod(routine);
+    const periodBounds = routinePeriodInstants(currentPeriod);
     const count = db.prepare('SELECT COUNT(*) AS n FROM completions WHERE routine_id=? AND completed_at>=? AND completed_at<?')
-      .get(routine.id, getCurrentPeriod(routine).start.toISOString(), getCurrentPeriod(routine).end.toISOString()).n;
+      .get(routine.id, periodBounds.start.toISOString(), periodBounds.end.toISOString()).n;
     if (routine.linked_to_routine_id && Number(count) < Number(routine.max_count || 1)) {
       db.prepare('UPDATE routines SET linked_completed_anchor=NULL,updated_at=? WHERE id=?').run(nowIso(), routine.id);
     }
