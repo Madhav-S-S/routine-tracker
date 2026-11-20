@@ -2300,7 +2300,8 @@ async function restoreDriveStateBeforeInitialTaskSync() {
   for (const user of users) {
     try {
       if (DRIVE_RESTORE_ON_STARTUP) {
-        await restoreDriveBackup(user.id, { allowMissing: true });
+        const restored = await restoreDriveBackup(user.id, { allowMissing: true });
+        console.log(`Initial Drive restore complete for ${user.id}: ${restored.routineCount || 0} routines, ${restored.googleTaskMappingCount || 0} Google Task mappings.`);
       } else {
         // Recovery mode: use this installation's existing mappings as the
         // source of truth for one controlled migration backup.
