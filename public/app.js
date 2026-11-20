@@ -1179,8 +1179,8 @@ function installHandlers() {
     event.preventDefault();
     setPage(state.activePage === 'settings' ? settingsReturnPage : 'dashboard');
   }));
-  $('.brand-back-button').forEach((button) => button.addEventListener('click', () => setPage(settingsReturnPage)));
-  $('[data-page]').forEach((button) => button.addEventListener('click', () => setPage(button.dataset.page)));
+  $$('.brand-back-button').forEach((button) => button.addEventListener('click', () => setPage(settingsReturnPage)));
+  $$('[data-page]').forEach((button) => button.addEventListener('click', () => setPage(button.dataset.page)));
   $$('[data-go-page]').forEach((button) => button.addEventListener('click', () => setPage(button.dataset.goPage)));
   $('#newRoutineButton').addEventListener('click', () => openRoutineModal());
   $('#calendarNewButton').addEventListener('click', () => openRoutineModal());

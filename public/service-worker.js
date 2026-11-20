@@ -1,11 +1,11 @@
 'use strict';
 
-const CACHE_NAME = 'routine-tracker-shell-v1';
+const CACHE_NAME = 'routine-tracker-shell-v2';
 const APP_SHELL = [
   '/',
   '/index.html',
   '/styles.css?v=20261120-pwa-colors',
-  '/app.js?v=20261120-pwa-colors',
+  '/app.js?v=20261120-click-fix',
   '/favicon.svg',
   '/manifest.webmanifest',
   '/icons/icon-192.png',
