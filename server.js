@@ -515,12 +515,12 @@ function routineTaskSlotKey(routine, item = null) {
 // installations can therefore rediscover the same remote task instead of
 // creating another copy when their local mapping table is empty.
 function routineTaskMarker(routineId, slotKey) {
-  return `[[Routine Tracker task:${sha256(`${routineId}\\u0000${slotKey}`).slice(0, 32)}]]`;
+  return `[[Routine Tracker task:${sha256(`${routineId}${String.fromCharCode(0)}${slotKey}`).slice(0, 32)}]]`;
 }
 function routineTaskNotes(routine, slotKey) {
   const baseNotes = String(routine.notes || 'Routine Tracker checklist item');
   const marker = routineTaskMarker(routine.id, slotKey);
-  return baseNotes.includes(marker) ? baseNotes : `${baseNotes}\\n\\n${marker}`;
+  return baseNotes.includes(marker) ? baseNotes : `${baseNotes}\n\n${marker}`;
 }
 async function listAllDefaultGoogleTasks(tasks) {
   const results = [];
@@ -1471,18 +1471,33 @@ async function restoreDriveBackup(userId, options = {}) {
     WHERE account_key=?`).get(accountKey);
   const databaseBackupFileId = account?.database_backup_file_id ||
     await findDriveFileByName(drive, 'Routine Tracker Database.sqlite');
-  let fileId = account?.drive_file_id || null;
-  let backup = null;
+  const fileId = account?.drive_file_id ||
+    await findDriveFileByName(drive, 'Routine Tracker Backup.json');
+  const candidates = [];
 
+  // Compare Drive's modification timestamps. The JSON export can be newer
+  // than the periodic SQLite snapshot, so never blindly prefer SQLite.
   if (databaseBackupFileId) {
-    backup = await readSqliteBackupFromDrive(drive, databaseBackupFileId, accountKey);
-  } else {
-    fileId = fileId || await findDriveFileByName(drive, 'Routine Tracker Backup.json');
-    if (fileId) {
-      const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
-      backup = safeJsonParse(await readStream(response.data));
-    }
+    const meta = await drive.files.get({ fileId: databaseBackupFileId, fields: 'id,modifiedTime' });
+    candidates.push({
+      kind: 'sqlite',
+      modifiedAt: Date.parse(meta.data.modifiedTime || '') || 0,
+      backup: await readSqliteBackupFromDrive(drive, databaseBackupFileId, accountKey)
+    });
   }
+  if (fileId) {
+    const meta = await drive.files.get({ fileId, fields: 'id,modifiedTime' });
+    const response = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+    const jsonBackup = safeJsonParse(await readStream(response.data));
+    if (jsonBackup) candidates.push({
+      kind: 'json',
+      modifiedAt: Date.parse(meta.data.modifiedTime || '') || 0,
+      backup: jsonBackup
+    });
+  }
+  candidates.sort((a, b) => b.modifiedAt - a.modifiedAt);
+  const selected = candidates[0] || null;
+  const backup = selected?.backup || null;
 
   if (!backup) {
     if (options.allowMissing) {
@@ -1603,7 +1618,7 @@ async function restoreDriveBackup(userId, options = {}) {
     completionCount,
     googleTaskMappingCount,
     backupExportedAt: backup.exportedAt || null,
-    source: databaseBackupFileId ? 'sqlite' : 'json'
+    source: selected.kind
   };
 }
 const calendarSyncLocks = new Set();
