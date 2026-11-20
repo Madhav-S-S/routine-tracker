@@ -29,6 +29,7 @@ const calendarLoadPromises = new Map();
 let calendarManualTaskRefreshTimer = null;
 let foregroundRefreshRunning = false;
 let lastForegroundRefreshAt = 0;
+let settingsReturnPage = 'dashboard';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -167,19 +168,36 @@ function routineIconBackgroundOverride(routineId) {
   if (!routineId) return null;
   return readRoutineIconBackgrounds()[routineId] || null;
 }
-function persistRoutineIconBackground(routineId, color) {
+function removeLegacyRoutineIconBackground(routineId) {
   if (!routineId) return;
   const backgrounds = readRoutineIconBackgrounds();
-  if (color && /^#[0-9a-f]{6}$/i.test(color)) backgrounds[routineId] = color.toLowerCase();
-  else delete backgrounds[routineId];
+  if (!Object.prototype.hasOwnProperty.call(backgrounds, routineId)) return;
+  delete backgrounds[routineId];
   try { localStorage.setItem(ICON_BACKGROUND_STORAGE_KEY, JSON.stringify(backgrounds)); }
-  catch { toast('Could not save the icon background in this browser.', 'error'); }
+  catch { console.warn('Could not clear a migrated routine icon background from this browser.'); }
+}
+async function migrateLegacyRoutineIconBackgrounds() {
+  const backgrounds = readRoutineIconBackgrounds();
+  const pending = state.routines.filter((routine) => !routine.icon_background && backgrounds[routine.id]);
+  if (!pending.length) return;
+  const results = await Promise.allSettled(pending.map((routine) => api(`/api/routines/${encodeURIComponent(routine.id)}`, {
+    method: 'PATCH', body: JSON.stringify({ iconBackground: backgrounds[routine.id] })
+  })));
+  results.forEach((result, index) => {
+    if (result.status !== 'fulfilled') {
+      console.warn(`Legacy icon color migration failed for ${pending[index].id}:`, result.reason?.message || result.reason);
+      return;
+    }
+    const saved = result.value.routine;
+    if (saved) state.routines = state.routines.map((routine) => routine.id === saved.id ? saved : routine);
+    removeLegacyRoutineIconBackground(pending[index].id);
+  });
 }
 function selectedIconBackground() {
   return state.selectedIconBackground || automaticIconBackground(state.selectedIconColor || state.selectedColor);
 }
 function routineIconBackground(routine) {
-  return routineIconBackgroundOverride(routine.id) || automaticIconBackground(routine.color);
+  return routine.icon_background || automaticIconBackground(routine.color);
 }
 function setSelectedIconBackground(color) {
   state.selectedIconBackground = color && /^#[0-9a-f]{6}$/i.test(color) ? color.toLowerCase() : null;
@@ -363,6 +381,7 @@ function loadBootstrap(showError = true) {
       state.csrfToken = data.csrfToken;
       state.user = data.user;
       state.routines = data.routines || [];
+      await migrateLegacyRoutineIconBackgrounds();
       state.stats = data.stats || {};
       state.google = data.google || { connected: false };
       renderAll();
@@ -506,7 +525,9 @@ function renderAll() {
 
 function setPage(page) {
   if (!['dashboard', 'calendar', 'routines', 'history', 'settings'].includes(page)) page = 'dashboard';
+  if (page === 'settings' && state.activePage !== 'settings') settingsReturnPage = state.activePage || 'dashboard';
   state.activePage = page;
+  document.body.classList.toggle('settings-open', page === 'settings');
   $$('.page-view').forEach((view) => view.classList.toggle('active', view.id === `page-${page}`));
   $$('.nav-item[data-page], .mobile-nav-item[data-page]').forEach((button) => button.classList.toggle('active', button.dataset.page === page));
   const label = ({ dashboard: 'Dashboard', calendar: 'Calendar', routines: 'All routines', history: 'Activity', settings: 'Settings & sync' })[page];
@@ -799,7 +820,7 @@ function openRoutineModal(routine = null) {
   $('#routineTitle').value = routine?.title || '';
   $('#routineNotes').value = routine?.notes || '';
   const type = routine?.type || 'frequency';
-  state.selectedIconBackground = routineIconBackgroundOverride(routine?.id);
+  state.selectedIconBackground = routine?.icon_background || null;
   setSelectedType(type);
   setSelectedColor(routine?.color || 'lavender');
   state.selectedIconName = routine?.icon_name && routine.icon_name !== 'sparkles' ? routine.icon_name : suggestIconName(routine?.title || '');
@@ -856,7 +877,7 @@ async function saveRoutine(event) {
   const linkedToRoutineId = linked ? $('#linkedRoutine').value : null;
   const linkedOffsetDays = ($('#linkedDirection').value === 'before' ? -1 : 1) * Number($('#linkedDays').value || 0);
   if (linked && !linkedToRoutineId) return toast('Choose the routine this task should follow.', 'error');
-  let body = { title, notes: $('#routineNotes').value, color: state.selectedColor, iconName: state.selectedIconName, iconColor: resolveColor(state.selectedColor), type: state.selectedType, linkedToRoutineId, linkedOffsetDays };
+  let body = { title, notes: $('#routineNotes').value, color: state.selectedColor, iconName: state.selectedIconName, iconColor: resolveColor(state.selectedColor), iconBackground: state.selectedIconBackground, type: state.selectedType, linkedToRoutineId, linkedOffsetDays };
   if (state.selectedType === 'frequency') {
     const startAt = dateInputToIso($('#startAt').value);
     if (!startAt) return toast('Enter the start date as DD-MM-YYYY or choose it from the calendar.', 'error');
@@ -882,7 +903,7 @@ async function saveRoutine(event) {
   try {
     const result = await api(id ? `/api/routines/${encodeURIComponent(id)}` : '/api/routines', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(body) });
     const savedRoutineId = id || result.routine?.id;
-    if (savedRoutineId) persistRoutineIconBackground(savedRoutineId, state.selectedIconBackground);
+    if (savedRoutineId) removeLegacyRoutineIconBackground(savedRoutineId);
     closeRoutineModal();
     await loadBootstrap();
     if (state.activePage === 'calendar') await loadCalendar();
@@ -1154,7 +1175,12 @@ async function unlinkGoogle() {
 }
 
 function installHandlers() {
-  $$('[data-page]').forEach((button) => button.addEventListener('click', () => setPage(button.dataset.page)));
+  $('.brand').forEach((brand) => brand.addEventListener('click', (event) => {
+    event.preventDefault();
+    setPage(state.activePage === 'settings' ? settingsReturnPage : 'dashboard');
+  }));
+  $('.brand-back-button').forEach((button) => button.addEventListener('click', () => setPage(settingsReturnPage)));
+  $('[data-page]').forEach((button) => button.addEventListener('click', () => setPage(button.dataset.page)));
   $$('[data-go-page]').forEach((button) => button.addEventListener('click', () => setPage(button.dataset.goPage)));
   $('#newRoutineButton').addEventListener('click', () => openRoutineModal());
   $('#calendarNewButton').addEventListener('click', () => openRoutineModal());
@@ -1258,6 +1284,10 @@ function installHandlers() {
 }
 
 async function init() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/service-worker.js', { scope: '/' })
+      .catch((error) => console.warn('Routine Tracker could not register its offline app shell:', error));
+  }
   installHandlers();
   setupDateInputs();
   const todayText = formatDateText(localDateInput());
