@@ -385,6 +385,23 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+
+// Static app files are public: serve them before SQLite session reads and cache
+// versioned resources locally so repeat launches do not refetch them.
+app.use(express.static(path.join(__dirname, 'public'), {
+  maxAge: '1y',
+  immutable: true,
+  setHeaders(res, filePath) {
+    const name = path.basename(filePath);
+    if (name === 'index.html' || name === 'service-worker.js') {
+      res.setHeader('Cache-Control', 'no-cache');
+    } else if (name === 'manifest.webmanifest') {
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+    } else {
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    }
+  }
+}));
 app.use(morgan('tiny'));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false, limit: '2mb' }));
@@ -420,6 +437,8 @@ app.use((req, res, next) => {
   } catch (error) { next(error); }
 });
 app.use('/api', (req, res, next) => {
+  // API payloads contain per-user information and must never be cached.
+  res.setHeader('Cache-Control', 'no-store');
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
   if (!req.session.csrfToken || req.get('X-CSRF-Token') !== req.session.csrfToken) {
     return res.status(403).json({ error: 'This page session expired. Refresh the page and try again.' });
@@ -1188,14 +1207,16 @@ async function completeCurrentGoogleTask(userId, routine) {
   return { ...row, account_key: account.account_key };
 }
 
-function publicRoutine(routine, now = new Date()) {
+function publicRoutine(routine, now = new Date(), context = null) {
   const progressive = parseBooleanFlag(routine.progressive, true);
   const item = { ...routine, archived: Boolean(routine.archived), progressive };
   if (routine.type === 'frequency') {
-    const window = getCurrentPeriod(routine, now);
-    const count = db.prepare(`SELECT COUNT(*) AS n FROM completions
-      WHERE routine_id = ? AND completed_at >= ? AND completed_at < ?`)
-      .get(routine.id, window.start.toISOString(), window.end.toISOString()).n;
+    const window = context?.periods.get(routine.id) || getCurrentPeriod(routine, now);
+    const count = context?.completionCounts.has(routine.id)
+      ? context.completionCounts.get(routine.id)
+      : db.prepare(`SELECT COUNT(*) AS n FROM completions
+          WHERE routine_id = ? AND completed_at >= ? AND completed_at < ?`)
+          .get(routine.id, window.start.toISOString(), window.end.toISOString()).n;
     const duration = Math.max(1, window.end.getTime() - window.start.getTime());
     const hasStarted = now.getTime() >= window.start.getTime();
     const elapsedFraction = Math.max(0, Math.min(1, (now.getTime() - window.start.getTime()) / duration));
@@ -1238,8 +1259,10 @@ function publicRoutine(routine, now = new Date()) {
     item.nextOpportunityAt = nextOpportunityAt;
     item.cadenceLabel = `${routine.min_count}${routine.max_count > routine.min_count ? `–${routine.max_count}` : ''} times every ${routine.period_value} ${unitLabel(routine.period_unit)}`;
     if (routine.linked_to_routine_id) {
-      const parent = db.prepare('SELECT title FROM routines WHERE id=? AND user_id=?').get(routine.linked_to_routine_id, routine.user_id);
-      item.linkedRoutineTitle = parent?.title || 'Linked routine';
+      const parentTitle = context?.parentTitles.has(routine.linked_to_routine_id)
+        ? context.parentTitles.get(routine.linked_to_routine_id)
+        : db.prepare('SELECT title FROM routines WHERE id=? AND user_id=?').get(routine.linked_to_routine_id, routine.user_id)?.title;
+      item.linkedRoutineTitle = parentTitle || 'Linked routine';
       item.cadenceLabel += ` · Linked ${routine.linked_offset_days < 0 ? 'before' : 'after'} ${item.linkedRoutineTitle}`;
     }
   } else {
@@ -1248,16 +1271,63 @@ function publicRoutine(routine, now = new Date()) {
     item.isDue = due ? (due.getTime() <= now.getTime() && !alreadyDoneForLinkedOccurrence) : !routine.linked_to_routine_id;
     item.daysUntilDue = due ? Math.ceil((due.getTime() - now.getTime()) / 86400000) : 0;
     if (routine.linked_to_routine_id) {
-      const parent = db.prepare('SELECT title FROM routines WHERE id=? AND user_id=?').get(routine.linked_to_routine_id, routine.user_id);
-      item.linkedRoutineTitle = parent?.title || 'Linked routine';
+      const parentTitle = context?.parentTitles.has(routine.linked_to_routine_id)
+        ? context.parentTitles.get(routine.linked_to_routine_id)
+        : db.prepare('SELECT title FROM routines WHERE id=? AND user_id=?').get(routine.linked_to_routine_id, routine.user_id)?.title;
+      item.linkedRoutineTitle = parentTitle || 'Linked routine';
       item.cadenceLabel = `Linked · ${Math.abs(routine.linked_offset_days || 0)} day${Math.abs(routine.linked_offset_days || 0) === 1 ? '' : 's'} ${routine.linked_offset_days < 0 ? 'before' : 'after'} ${item.linkedRoutineTitle}`;
     } else {
       item.cadenceLabel = `Every ${routine.interval_value} ${unitLabel(routine.interval_unit)}`;
     }
   }
   item.taskSlotKey = routineTaskSlotKey(routine, item);
-  item.taskSuppressed = isRoutineTaskSuppressed(routine.user_id, routine.id, item.taskSlotKey);
+  item.taskSuppressed = context
+    ? context.suppressedSlots.has(JSON.stringify([routine.id, item.taskSlotKey]))
+    : isRoutineTaskSuppressed(routine.user_id, routine.id, item.taskSlotKey);
   return item;
+}
+function listRoutines(userId, includeArchived = false) {
+  const parentRows = db.prepare(`SELECT DISTINCT p.id FROM routines p JOIN routines c
+    ON c.linked_to_routine_id=p.id AND c.user_id=p.user_id AND c.archived=0
+    WHERE p.user_id=? AND p.archived=0`).all(userId);
+  for (const parent of parentRows) updateLinkedRoutineSchedules(userId, parent.id);
+
+  const allRows = db.prepare('SELECT * FROM routines WHERE user_id = ? ORDER BY created_at DESC').all(userId);
+  const rows = includeArchived ? allRows : allRows.filter((row) => !row.archived);
+  const now = new Date();
+  const periods = new Map();
+  const completionCounts = new Map();
+  const frequencyRows = rows.filter((row) => row.type === 'frequency').map((routine) => {
+    const window = getCurrentPeriod(routine, now);
+    periods.set(routine.id, window);
+    return { routine, window };
+  });
+
+  // Batch current-period counts through indexed joins instead of a query
+  // per frequency routine.
+  for (let offset = 0; offset < frequencyRows.length; offset += 200) {
+    const chunk = frequencyRows.slice(offset, offset + 200);
+    const slots = chunk.map(() => '(?,?,?)').join(',');
+    const params = chunk.flatMap(({ routine, window }) => [
+      routine.id, window.start.toISOString(), window.end.toISOString()
+    ]);
+    const counts = db.prepare(`WITH period_bounds(routine_id, period_start, period_end) AS (VALUES ${slots})
+      SELECT p.routine_id, COUNT(c.id) AS completion_count
+      FROM period_bounds p
+      LEFT JOIN completions c
+        ON c.routine_id=p.routine_id
+        AND c.completed_at>=p.period_start
+        AND c.completed_at<p.period_end
+      GROUP BY p.routine_id`).all(...params);
+    for (const row of counts) completionCounts.set(row.routine_id, Number(row.completion_count || 0));
+  }
+
+  const parentTitles = new Map(allRows.map((row) => [row.id, row.title]));
+  const suppressedSlots = new Set(db.prepare(
+    'SELECT routine_id,slot_key FROM routine_task_suppressions WHERE user_id=?'
+  ).all(userId).map((row) => JSON.stringify([row.routine_id, row.slot_key])));
+  const context = { periods, completionCounts, parentTitles, suppressedSlots };
+  return rows.map((row) => publicRoutine(row, now, context));
 }
 function listRoutines(userId, includeArchived = false) {
   // Keep linked child dates aligned with their parent's next occurrence even
@@ -2193,11 +2263,20 @@ app.get('/api/calendar', async (req, res) => {
     let syncWarning = null;
     if (account) {
       queueTaskPullSync(req.userId);
-      try {
-        await syncGoogleManualTasksForMonth(req.userId, account, month, req.query.refreshTasks === '1');
-      } catch (error) {
-        syncWarning = `Google Tasks could not be refreshed: ${error.message}`;
-        console.warn(`Google Tasks month sync failed for ${account.account_key} (${month}):`, error.message);
+      const forceTaskRefresh = req.query.refreshTasks === '1';
+      const monthSync = syncGoogleManualTasksForMonth(req.userId, account, month, forceTaskRefresh);
+      if (forceTaskRefresh) {
+        try { await monthSync; }
+        catch (error) {
+          syncWarning = `Google Tasks could not be refreshed: ${error.message}`;
+          console.warn(`Google Tasks month sync failed for ${account.account_key} (${month}):`, error.message);
+        }
+      } else {
+        // Serve the local month snapshot immediately; a first-time Tasks scan
+        // can need several Google API round trips.
+        monthSync.catch((error) => {
+          console.warn(`Google Tasks month sync failed for ${account.account_key} (${month}):`, error.message);
+        });
       }
       const last = account.last_calendar_sync ? new Date(account.last_calendar_sync).getTime() : 0;
       if (Date.now() - last > CALENDAR_SYNC_INTERVAL_MS && !calendarSyncLocks.has(account.account_key)) {
@@ -2278,7 +2357,7 @@ app.post('/api/drive/restore', async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, version: APP_VERSION, time: nowIso() }));
-app.use(express.static(path.join(__dirname, 'public'), { maxAge: process.env.NODE_ENV === 'production' ? '1h' : 0 }));
+
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 app.use((error, req, res, next) => {
   console.error('Request error:', error.stack || error.message || error);

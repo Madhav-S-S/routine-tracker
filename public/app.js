@@ -26,7 +26,12 @@ const state = {
 let bootstrapLoadPromise = null;
 let historyLoadPromise = null;
 const calendarLoadPromises = new Map();
-let calendarManualTaskRefreshTimer = null;
+const calendarDataCache = new Map();
+const DATA_CACHE_TTL_MS = 30000;
+let historyCachedAt = 0;
+let historyHasLoaded = false;
+let lastBootstrapSnapshot = '';
+let legacyMigrationPromise = null;
 let foregroundRefreshRunning = false;
 let lastForegroundRefreshAt = 0;
 let settingsReturnPage = 'dashboard';
@@ -179,7 +184,8 @@ function removeLegacyRoutineIconBackground(routineId) {
 async function migrateLegacyRoutineIconBackgrounds() {
   const backgrounds = readRoutineIconBackgrounds();
   const pending = state.routines.filter((routine) => !routine.icon_background && backgrounds[routine.id]);
-  if (!pending.length) return;
+  if (!pending.length) return false;
+  let migrated = false;
   const results = await Promise.allSettled(pending.map((routine) => api(`/api/routines/${encodeURIComponent(routine.id)}`, {
     method: 'PATCH', body: JSON.stringify({ iconBackground: backgrounds[routine.id] })
   })));
@@ -189,9 +195,13 @@ async function migrateLegacyRoutineIconBackgrounds() {
       return;
     }
     const saved = result.value.routine;
-    if (saved) state.routines = state.routines.map((routine) => routine.id === saved.id ? saved : routine);
+    if (saved) {
+      state.routines = state.routines.map((routine) => routine.id === saved.id ? saved : routine);
+      migrated = true;
+    }
     removeLegacyRoutineIconBackground(pending[index].id);
   });
+  return migrated;
 }
 function selectedIconBackground() {
   return state.selectedIconBackground || automaticIconBackground(state.selectedIconColor || state.selectedColor);
@@ -363,13 +373,16 @@ function setSyncState(status, label) {
 
 async function api(path, options = {}) {
   const headers = { ...(options.headers || {}) };
+  const method = (options.method || 'GET').toUpperCase();
   if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
-  if (!['GET', 'HEAD'].includes((options.method || 'GET').toUpperCase()) && state.csrfToken) {
-    headers['X-CSRF-Token'] = state.csrfToken;
-  }
+  if (!['GET', 'HEAD'].includes(method) && state.csrfToken) headers['X-CSRF-Token'] = state.csrfToken;
   const response = await fetch(path, { credentials: 'same-origin', ...options, headers });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`);
+  if (!['GET', 'HEAD'].includes(method)) {
+    calendarDataCache.clear();
+    historyHasLoaded = false;
+  }
   return data;
 }
 
@@ -381,11 +394,25 @@ function loadBootstrap(showError = true) {
       state.csrfToken = data.csrfToken;
       state.user = data.user;
       state.routines = data.routines || [];
-      await migrateLegacyRoutineIconBackgrounds();
       state.stats = data.stats || {};
       state.google = data.google || { connected: false };
-      renderAll();
+      const snapshot = JSON.stringify([state.user, state.routines, state.stats, state.google]);
+      if (snapshot !== lastBootstrapSnapshot) {
+        lastBootstrapSnapshot = snapshot;
+        renderAll();
+      }
       setSyncState('saved', state.google.connected ? 'Saved · Google connected' : 'Saved on this server');
+      if (!legacyMigrationPromise) {
+        const migration = migrateLegacyRoutineIconBackgrounds();
+        legacyMigrationPromise = migration.then((changed) => {
+          if (!changed) return;
+          renderRoutineGrids();
+          renderChecklist();
+          lastBootstrapSnapshot = JSON.stringify([state.user, state.routines, state.stats, state.google]);
+        }).catch((error) => {
+          console.warn('Legacy icon colour migration failed:', error?.message || error);
+        }).finally(() => { legacyMigrationPromise = null; });
+      }
       return data;
     } catch (error) {
       if (showError) toast(error.message, 'error');
@@ -537,7 +564,7 @@ function setPage(page) {
   if (page === 'calendar') loadCalendar();
   if (page === 'history') loadHistory();
   if (page === 'settings') renderGoogleSettings();
-  window.scrollTo({ top: 0, behavior: 'smooth' });
+  window.scrollTo(0, 0);
 }
 
 function loadCalendar(options = {}) {
@@ -545,24 +572,32 @@ function loadCalendar(options = {}) {
   const forceTaskRefresh = options.forceTaskRefresh === true;
   const requestKey = `${month}${forceTaskRefresh ? ':force-tasks' : ''}`;
   if (calendarLoadPromises.has(requestKey)) return calendarLoadPromises.get(requestKey);
+  const cachedEntry = calendarDataCache.get(month);
+  if (cachedEntry) {
+    state.calendarEvents = cachedEntry.data.events || [];
+    state.calendarWarning = cachedEntry.data.syncWarning || null;
+    renderCalendarGrid();
+    $('#calendarFootnote').textContent = cachedEntry.data.syncWarning
+      ? `Calendar sync needs attention: ${cachedEntry.data.syncWarning}`
+      : state.google.connected
+        ? `Google Calendar refreshed ${timeAgo(cachedEntry.data.googleLastSync)}. Your routine dates are shown here, too.`
+        : 'Connect Google in Settings to display your Google Calendar events and dated Google Tasks here.';
+    if (!forceTaskRefresh && Date.now() - cachedEntry.cachedAt < DATA_CACHE_TTL_MS) return Promise.resolve(cachedEntry.data);
+  } else {
+    state.calendarEvents = [];
+    state.calendarWarning = null;
+    $('#calendarGrid').innerHTML = '<div class="calendar-empty">Loading your month…</div>';
+  }
   $('#calendarMonthTitle').textContent = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' }).format(state.calendarMonth);
-  if (!state.calendarEvents.length) $('#calendarGrid').innerHTML = '<div class="calendar-empty">Loading your month…</div>';
   const request = (async () => {
     try {
       const data = await api(`/api/calendar?month=${encodeURIComponent(month)}${forceTaskRefresh ? '&refreshTasks=1' : ''}`);
-      // Ignore a late response if the user has already navigated to another month.
+      calendarDataCache.set(month, { data, cachedAt: Date.now() });
+      while (calendarDataCache.size > 4) calendarDataCache.delete(calendarDataCache.keys().next().value);
       const currentMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
       if (currentMonth !== month) return data;
       state.calendarEvents = data.events || [];
       state.calendarWarning = data.syncWarning;
-      const externalTaskSyncAge = Date.now() - (Date.parse(data.googleTasksLastSync || '') || 0);
-      if (state.google.connected && externalTaskSyncAge > 30000 && !calendarManualTaskRefreshTimer) {
-        calendarManualTaskRefreshTimer = window.setTimeout(() => {
-          calendarManualTaskRefreshTimer = null;
-          const visibleMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
-          if (state.activePage === 'calendar' && visibleMonth === month) loadCalendar();
-        }, 5000);
-      }
       if (state.selectedCalendarDate && !state.selectedCalendarDate.startsWith(month)) state.selectedCalendarDate = null;
       renderCalendarGrid();
       $('#calendarFootnote').textContent = data.syncWarning
@@ -573,8 +608,8 @@ function loadCalendar(options = {}) {
       return data;
     } catch (error) {
       const currentMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
-      if (currentMonth === month) $('#calendarGrid').innerHTML = `<div class="calendar-empty">${escapeHtml(error.message)}</div>`;
-      return null;
+      if (currentMonth === month && !cachedEntry) $('#calendarGrid').innerHTML = `<div class="calendar-empty">${escapeHtml(error.message)}</div>`;
+      return cachedEntry?.data || null;
     }
   })();
   calendarLoadPromises.set(requestKey, request);
@@ -753,6 +788,7 @@ function renderCalendarGrid() {
 
 function loadHistory() {
   if (historyLoadPromise) return historyLoadPromise;
+  if (historyHasLoaded && Date.now() - historyCachedAt < DATA_CACHE_TTL_MS) return Promise.resolve({ cached: true });
   if (!$('#historyList').children.length) $('#historyList').innerHTML = '<div class="history-empty">Loading activity…</div>';
   const request = (async () => {
     try {
@@ -760,9 +796,11 @@ function loadHistory() {
       const rows = data.history || [];
       if (!rows.length) {
         $('#historyList').innerHTML = '<div class="history-empty">Your completed routines will appear here. Complete a routine to get started.</div>';
-        return data;
+      } else {
+        $('#historyList').innerHTML = rows.map((row) => `<div class="history-entry"><div class="history-mark">✓</div><div class="history-entry-copy"><strong>${escapeHtml(row.title)}</strong><small>${escapeHtml(row.note || 'Routine completed')}</small></div><div class="history-date">${formatDate(row.completed_at, { day: 'numeric', month: 'short' })} · ${formatDate(row.completed_at, { hour: 'numeric', minute: '2-digit' })}</div><button class="history-delete" type="button" data-action="delete-activity" data-id="${escapeHtml(row.id)}" aria-label="Delete activity" title="Delete activity">×</button></div>`).join('');
       }
-      $('#historyList').innerHTML = rows.map((row) => `<div class="history-entry"><div class="history-mark">✓</div><div class="history-entry-copy"><strong>${escapeHtml(row.title)}</strong><small>${escapeHtml(row.note || 'Routine completed')}</small></div><div class="history-date">${formatDate(row.completed_at, { day: 'numeric', month: 'short' })} · ${formatDate(row.completed_at, { hour: 'numeric', minute: '2-digit' })}</div><button class="history-delete" type="button" data-action="delete-activity" data-id="${escapeHtml(row.id)}" aria-label="Delete activity" title="Delete activity">×</button></div>`).join('');
+      historyHasLoaded = true;
+      historyCachedAt = Date.now();
       return data;
     } catch (error) {
       $('#historyList').innerHTML = `<div class="history-empty">${escapeHtml(error.message)}</div>`;
@@ -770,9 +808,7 @@ function loadHistory() {
     }
   })();
   historyLoadPromise = request;
-  return request.finally(() => {
-    if (historyLoadPromise === request) historyLoadPromise = null;
-  });
+  return request.finally(() => { if (historyLoadPromise === request) historyLoadPromise = null; });
 }
 async function deleteActivity(id) {
   if (!confirm('Delete this activity? This will remove it from your history, update routine progress, and delete its matching Google Task if one was synced.')) return;

@@ -1,11 +1,11 @@
 'use strict';
 
-const CACHE_NAME = 'routine-tracker-shell-v2';
+const CACHE_NAME = 'routine-tracker-shell-v3';
 const APP_SHELL = [
   '/',
   '/index.html',
-  '/styles.css?v=20261120-pwa-colors',
-  '/app.js?v=20261120-click-fix',
+  '/styles.css?v=20261120-speed-v1',
+  '/app.js?v=20261120-speed-v1',
   '/favicon.svg',
   '/manifest.webmanifest',
   '/icons/icon-192.png',
@@ -33,34 +33,37 @@ self.addEventListener('fetch', (event) => {
   const request = event.request;
   const url = new URL(request.url);
   if (request.method !== 'GET' || url.origin !== self.location.origin) return;
-
-  // Never cache user data, sessions, Google OAuth responses, or API traffic.
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth/')) return;
 
   if (request.mode === 'navigate') {
-    event.respondWith(
-      fetch(request)
-        .then((response) => {
-          if (response.ok) {
-            const copy = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put('/', copy));
-          }
-          return response;
-        })
-        .catch(async () => (await caches.match(request)) || (await caches.match('/')) || Response.error())
-    );
+    const update = fetch(request).then(async (response) => {
+      if (response.ok) {
+        const cache = await caches.open(CACHE_NAME);
+        await cache.put('/', response.clone());
+        await cache.put('/index.html', response.clone());
+      }
+      return response;
+    });
+    event.waitUntil(update.then(() => undefined).catch(() => undefined));
+    event.respondWith((async () => {
+      const cached = await caches.match('/') || await caches.match('/index.html');
+      if (cached) return cached;
+      try { return await update; }
+      catch { return Response.error(); }
+    })());
     return;
   }
 
   if (APP_SHELL.some((entry) => new URL(entry, self.location.origin).pathname === url.pathname)) {
-    event.respondWith(
-      caches.match(request).then((cached) => {
-        const fresh = fetch(request).then((response) => {
-          if (response.ok) caches.open(CACHE_NAME).then((cache) => cache.put(request, response.clone()));
-          return response;
-        });
-        return cached || fresh;
-      })
-    );
+    event.respondWith(caches.match(request).then((cached) => {
+      if (cached) return cached;
+      return fetch(request).then(async (response) => {
+        if (response.ok) {
+          const cache = await caches.open(CACHE_NAME);
+          await cache.put(request, response.clone());
+        }
+        return response;
+      });
+    }));
   }
 });
