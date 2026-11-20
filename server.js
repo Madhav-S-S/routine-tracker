@@ -1064,7 +1064,7 @@ async function syncRoutineTasks(userId, routineIds = null, options = {}) {
       if (routine.type === 'interval' && routine.next_due_at) {
         if (routine.linked_to_routine_id && routine.last_completed_at &&
             new Date(routine.last_completed_at).getTime() >= new Date(routine.next_due_at).getTime()) continue;
-        dueDate = isoDateOnly(routine.next_due_at);
+        dueDate = routineDateOnly(routine.next_due_at);
         slotKey = routineTaskSlotKey(routine);
       } else if (routine.type === 'frequency' && routine.checkinAvailable) {
         // Publish against the fixed slot date, not the day a background sync runs.
