@@ -1175,7 +1175,7 @@ async function unlinkGoogle() {
 }
 
 function installHandlers() {
-  $('.brand').forEach((brand) => brand.addEventListener('click', (event) => {
+  $$('.brand').forEach((brand) => brand.addEventListener('click', (event) => {
     event.preventDefault();
     setPage(state.activePage === 'settings' ? settingsReturnPage : 'dashboard');
   }));
