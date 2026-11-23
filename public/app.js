@@ -26,9 +26,16 @@ const state = {
 let bootstrapLoadPromise = null;
 let historyLoadPromise = null;
 const calendarLoadPromises = new Map();
-let calendarManualTaskRefreshTimer = null;
+const calendarDataCache = new Map();
+let calendarDataRevision = 0;
+const DATA_CACHE_TTL_MS = 30000;
+let historyCachedAt = 0;
+let historyHasLoaded = false;
+let lastBootstrapSnapshot = '';
+let legacyMigrationPromise = null;
 let foregroundRefreshRunning = false;
 let lastForegroundRefreshAt = 0;
+let settingsReturnPage = 'dashboard';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -167,19 +174,41 @@ function routineIconBackgroundOverride(routineId) {
   if (!routineId) return null;
   return readRoutineIconBackgrounds()[routineId] || null;
 }
-function persistRoutineIconBackground(routineId, color) {
+function removeLegacyRoutineIconBackground(routineId) {
   if (!routineId) return;
   const backgrounds = readRoutineIconBackgrounds();
-  if (color && /^#[0-9a-f]{6}$/i.test(color)) backgrounds[routineId] = color.toLowerCase();
-  else delete backgrounds[routineId];
+  if (!Object.prototype.hasOwnProperty.call(backgrounds, routineId)) return;
+  delete backgrounds[routineId];
   try { localStorage.setItem(ICON_BACKGROUND_STORAGE_KEY, JSON.stringify(backgrounds)); }
-  catch { toast('Could not save the icon background in this browser.', 'error'); }
+  catch { console.warn('Could not clear a migrated routine icon background from this browser.'); }
+}
+async function migrateLegacyRoutineIconBackgrounds() {
+  const backgrounds = readRoutineIconBackgrounds();
+  const pending = state.routines.filter((routine) => !routine.icon_background && backgrounds[routine.id]);
+  if (!pending.length) return false;
+  let migrated = false;
+  const results = await Promise.allSettled(pending.map((routine) => api(`/api/routines/${encodeURIComponent(routine.id)}`, {
+    method: 'PATCH', body: JSON.stringify({ iconBackground: backgrounds[routine.id] })
+  })));
+  results.forEach((result, index) => {
+    if (result.status !== 'fulfilled') {
+      console.warn(`Legacy icon color migration failed for ${pending[index].id}:`, result.reason?.message || result.reason);
+      return;
+    }
+    const saved = result.value.routine;
+    if (saved) {
+      state.routines = state.routines.map((routine) => routine.id === saved.id ? saved : routine);
+      migrated = true;
+    }
+    removeLegacyRoutineIconBackground(pending[index].id);
+  });
+  return migrated;
 }
 function selectedIconBackground() {
   return state.selectedIconBackground || automaticIconBackground(state.selectedIconColor || state.selectedColor);
 }
 function routineIconBackground(routine) {
-  return routineIconBackgroundOverride(routine.id) || automaticIconBackground(routine.color);
+  return routine.icon_background || automaticIconBackground(routine.color);
 }
 function setSelectedIconBackground(color) {
   state.selectedIconBackground = color && /^#[0-9a-f]{6}$/i.test(color) ? color.toLowerCase() : null;
@@ -345,13 +374,19 @@ function setSyncState(status, label) {
 
 async function api(path, options = {}) {
   const headers = { ...(options.headers || {}) };
+  const method = (options.method || 'GET').toUpperCase();
   if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
-  if (!['GET', 'HEAD'].includes((options.method || 'GET').toUpperCase()) && state.csrfToken) {
-    headers['X-CSRF-Token'] = state.csrfToken;
-  }
+  if (!['GET', 'HEAD'].includes(method) && state.csrfToken) headers['X-CSRF-Token'] = state.csrfToken;
   const response = await fetch(path, { credentials: 'same-origin', ...options, headers });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`);
+  if (!['GET', 'HEAD'].includes(method)) {
+    // Invalidate completed and in-flight calendar snapshots after any write.
+    // Revision keys prevent an older in-flight response from replacing fresh data.
+    calendarDataRevision += 1;
+    calendarDataCache.clear();
+    historyHasLoaded = false;
+  }
   return data;
 }
 
@@ -365,8 +400,23 @@ function loadBootstrap(showError = true) {
       state.routines = data.routines || [];
       state.stats = data.stats || {};
       state.google = data.google || { connected: false };
-      renderAll();
+      const snapshot = JSON.stringify([state.user, state.routines, state.stats, state.google]);
+      if (snapshot !== lastBootstrapSnapshot) {
+        lastBootstrapSnapshot = snapshot;
+        renderAll();
+      }
       setSyncState('saved', state.google.connected ? 'Saved · Google connected' : 'Saved on this server');
+      if (!legacyMigrationPromise) {
+        const migration = migrateLegacyRoutineIconBackgrounds();
+        legacyMigrationPromise = migration.then((changed) => {
+          if (!changed) return;
+          renderRoutineGrids();
+          renderChecklist();
+          lastBootstrapSnapshot = JSON.stringify([state.user, state.routines, state.stats, state.google]);
+        }).catch((error) => {
+          console.warn('Legacy icon colour migration failed:', error?.message || error);
+        }).finally(() => { legacyMigrationPromise = null; });
+      }
       return data;
     } catch (error) {
       if (showError) toast(error.message, 'error');
@@ -433,7 +483,7 @@ function routineCard(routine) {
         <div class="routine-symbol">${renderRoutineIcon(routine.icon_name || suggestIconName(routine.title), iconTint, 19)}</div>
         <div class="routine-title-wrap"><h3 title="${escapeHtml(routine.title)}">${escapeHtml(routine.title)}</h3><p>${escapeHtml(isFrequency ? (routine.linked_to_routine_id ? 'Linked frequency target' : 'Frequency target') : routine.linked_to_routine_id ? 'Linked routine' : 'Repeat after completion')}</p></div>
         <button class="routine-menu" type="button" data-action="edit" data-id="${escapeHtml(routine.id)}" aria-label="Edit ${escapeHtml(routine.title)}" title="Edit">✎</button>
-        <button class="routine-menu" type="button" data-action="archive" data-id="${escapeHtml(routine.id)}" aria-label="Archive ${escapeHtml(routine.title)}" title="Archive">×</button>
+        <button class="routine-menu" type="button" data-action="archive" data-id="${escapeHtml(routine.id)}" aria-label="Delete ${escapeHtml(routine.title)}" title="Delete">×</button>
       </div>
       <div class="routine-meta"><span>${escapeHtml(isFrequency ? periodLabel(routine) : routine.cadenceLabel)}</span><strong>${escapeHtml(isFrequency ? `${routine.completedCount}/${routine.max_count}` : routine.daysUntilDue < 0 ? `${Math.abs(routine.daysUntilDue)}d late` : routine.daysUntilDue === 0 ? 'Today' : routine.daysUntilDue > 0 ? `${routine.daysUntilDue}d` : '—')}</strong></div>
       <div class="progress-track"><div class="progress-fill" style="width:${isFrequency ? progress : (routine.isDue ? 100 : Math.max(8, Math.min(100, 100 - routine.daysUntilDue * 5)))}%"></div></div>
@@ -441,8 +491,27 @@ function routineCard(routine) {
     </article>`;
 }
 function renderChecklist() {
+  const overdueDays = (routine) => {
+    if (routine.type === 'interval') return Math.max(0, -Number(routine.daysUntilDue || 0));
+    const unlockAt = Date.parse(routine.nextUnlockAt || routine.nextOpportunityAt || routine.periodStart || '');
+    return Number.isFinite(unlockAt) ? Math.max(0, Math.floor((Date.now() - unlockAt) / 86400000)) : 0;
+  };
+  const priority = (routine) => {
+    // Unmet frequency minimums come first. Overdue repeat-after routines follow,
+    // with the most overdue first; due-today items follow those. Minimum-met
+    // frequency routines remain visible but intentionally sit at the bottom.
+    if (routine.type === 'frequency' && !routine.minimumReached) return 0;
+    if (routine.type === 'interval') return routine.daysUntilDue < 0 ? 1 : 2;
+    return 3;
+  };
   const items = state.routines.filter((r) => !r.taskSuppressed && (r.type === 'frequency' ? r.checkinAvailable : r.isDue))
-    .sort((a, b) => (a.type === 'interval' ? 0 : 1) - (b.type === 'interval' ? 0 : 1) || (a.title || '').localeCompare(b.title || ''));
+    .sort((a, b) => {
+      const priorityDifference = priority(a) - priority(b);
+      if (priorityDifference) return priorityDifference;
+      const overdueDifference = overdueDays(b) - overdueDays(a);
+      if (overdueDifference) return overdueDifference;
+      return (a.title || '').localeCompare(b.title || '');
+    });
   $('#checklistCount').textContent = String(items.length);
   if (!items.length) {
     $('#checklistList').innerHTML = `<div class="checklist-empty"><div class="empty-check-icon">✓</div><div><strong>You're all caught up.</strong><small>No routines need your attention right now.</small></div></div>`;
@@ -506,7 +575,9 @@ function renderAll() {
 
 function setPage(page) {
   if (!['dashboard', 'calendar', 'routines', 'history', 'settings'].includes(page)) page = 'dashboard';
+  if (page === 'settings' && state.activePage !== 'settings') settingsReturnPage = state.activePage || 'dashboard';
   state.activePage = page;
+  document.body.classList.toggle('settings-open', page === 'settings');
   $$('.page-view').forEach((view) => view.classList.toggle('active', view.id === `page-${page}`));
   $$('.nav-item[data-page], .mobile-nav-item[data-page]').forEach((button) => button.classList.toggle('active', button.dataset.page === page));
   const label = ({ dashboard: 'Dashboard', calendar: 'Calendar', routines: 'All routines', history: 'Activity', settings: 'Settings & sync' })[page];
@@ -516,32 +587,43 @@ function setPage(page) {
   if (page === 'calendar') loadCalendar();
   if (page === 'history') loadHistory();
   if (page === 'settings') renderGoogleSettings();
-  window.scrollTo({ top: 0, behavior: 'smooth' });
+  window.scrollTo(0, 0);
 }
 
 function loadCalendar(options = {}) {
   const month = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
   const forceTaskRefresh = options.forceTaskRefresh === true;
-  const requestKey = `${month}${forceTaskRefresh ? ':force-tasks' : ''}`;
+  const requestRevision = calendarDataRevision;
+  const requestKey = `${month}:${requestRevision}${forceTaskRefresh ? ':force-tasks' : ''}`;
   if (calendarLoadPromises.has(requestKey)) return calendarLoadPromises.get(requestKey);
+  const cachedEntry = calendarDataCache.get(month);
+  if (cachedEntry) {
+    state.calendarEvents = cachedEntry.data.events || [];
+    state.calendarWarning = cachedEntry.data.syncWarning || null;
+    renderCalendarGrid();
+    $('#calendarFootnote').textContent = cachedEntry.data.syncWarning
+      ? `Calendar sync needs attention: ${cachedEntry.data.syncWarning}`
+      : state.google.connected
+        ? `Google Calendar refreshed ${timeAgo(cachedEntry.data.googleLastSync)}. Your routine dates are shown here, too.`
+        : 'Connect Google in Settings to display your Google Calendar events and dated Google Tasks here.';
+    if (!forceTaskRefresh && Date.now() - cachedEntry.cachedAt < DATA_CACHE_TTL_MS) return Promise.resolve(cachedEntry.data);
+  } else {
+    state.calendarEvents = [];
+    state.calendarWarning = null;
+    $('#calendarGrid').innerHTML = '<div class="calendar-empty">Loading your month…</div>';
+  }
   $('#calendarMonthTitle').textContent = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' }).format(state.calendarMonth);
-  if (!state.calendarEvents.length) $('#calendarGrid').innerHTML = '<div class="calendar-empty">Loading your month…</div>';
   const request = (async () => {
     try {
       const data = await api(`/api/calendar?month=${encodeURIComponent(month)}${forceTaskRefresh ? '&refreshTasks=1' : ''}`);
-      // Ignore a late response if the user has already navigated to another month.
+      if (requestRevision === calendarDataRevision) {
+        calendarDataCache.set(month, { data, cachedAt: Date.now() });
+        while (calendarDataCache.size > 4) calendarDataCache.delete(calendarDataCache.keys().next().value);
+      }
       const currentMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
-      if (currentMonth !== month) return data;
+      if (requestRevision !== calendarDataRevision || currentMonth !== month) return data;
       state.calendarEvents = data.events || [];
       state.calendarWarning = data.syncWarning;
-      const externalTaskSyncAge = Date.now() - (Date.parse(data.googleTasksLastSync || '') || 0);
-      if (state.google.connected && externalTaskSyncAge > 30000 && !calendarManualTaskRefreshTimer) {
-        calendarManualTaskRefreshTimer = window.setTimeout(() => {
-          calendarManualTaskRefreshTimer = null;
-          const visibleMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
-          if (state.activePage === 'calendar' && visibleMonth === month) loadCalendar();
-        }, 5000);
-      }
       if (state.selectedCalendarDate && !state.selectedCalendarDate.startsWith(month)) state.selectedCalendarDate = null;
       renderCalendarGrid();
       $('#calendarFootnote').textContent = data.syncWarning
@@ -552,8 +634,8 @@ function loadCalendar(options = {}) {
       return data;
     } catch (error) {
       const currentMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
-      if (currentMonth === month) $('#calendarGrid').innerHTML = `<div class="calendar-empty">${escapeHtml(error.message)}</div>`;
-      return null;
+      if (requestRevision === calendarDataRevision && currentMonth === month && !cachedEntry) $('#calendarGrid').innerHTML = `<div class="calendar-empty">${escapeHtml(error.message)}</div>`;
+      return cachedEntry?.data || null;
     }
   })();
   calendarLoadPromises.set(requestKey, request);
@@ -732,6 +814,7 @@ function renderCalendarGrid() {
 
 function loadHistory() {
   if (historyLoadPromise) return historyLoadPromise;
+  if (historyHasLoaded && Date.now() - historyCachedAt < DATA_CACHE_TTL_MS) return Promise.resolve({ cached: true });
   if (!$('#historyList').children.length) $('#historyList').innerHTML = '<div class="history-empty">Loading activity…</div>';
   const request = (async () => {
     try {
@@ -739,9 +822,11 @@ function loadHistory() {
       const rows = data.history || [];
       if (!rows.length) {
         $('#historyList').innerHTML = '<div class="history-empty">Your completed routines will appear here. Complete a routine to get started.</div>';
-        return data;
+      } else {
+        $('#historyList').innerHTML = rows.map((row) => `<div class="history-entry"><div class="history-mark">✓</div><div class="history-entry-copy"><strong>${escapeHtml(row.title)}</strong><small>${escapeHtml(row.note || 'Routine completed')}</small></div><div class="history-date">${formatDate(row.completed_at, { day: 'numeric', month: 'short' })} · ${formatDate(row.completed_at, { hour: 'numeric', minute: '2-digit' })}</div><button class="history-delete" type="button" data-action="delete-activity" data-id="${escapeHtml(row.id)}" aria-label="Delete activity" title="Delete activity">×</button></div>`).join('');
       }
-      $('#historyList').innerHTML = rows.map((row) => `<div class="history-entry"><div class="history-mark">✓</div><div class="history-entry-copy"><strong>${escapeHtml(row.title)}</strong><small>${escapeHtml(row.note || 'Routine completed')}</small></div><div class="history-date">${formatDate(row.completed_at, { day: 'numeric', month: 'short' })} · ${formatDate(row.completed_at, { hour: 'numeric', minute: '2-digit' })}</div><button class="history-delete" type="button" data-action="delete-activity" data-id="${escapeHtml(row.id)}" aria-label="Delete activity" title="Delete activity">×</button></div>`).join('');
+      historyHasLoaded = true;
+      historyCachedAt = Date.now();
       return data;
     } catch (error) {
       $('#historyList').innerHTML = `<div class="history-empty">${escapeHtml(error.message)}</div>`;
@@ -749,9 +834,7 @@ function loadHistory() {
     }
   })();
   historyLoadPromise = request;
-  return request.finally(() => {
-    if (historyLoadPromise === request) historyLoadPromise = null;
-  });
+  return request.finally(() => { if (historyLoadPromise === request) historyLoadPromise = null; });
 }
 async function deleteActivity(id) {
   if (!confirm('Delete this activity? This will remove it from your history, update routine progress, and delete its matching Google Task if one was synced.')) return;
@@ -799,7 +882,7 @@ function openRoutineModal(routine = null) {
   $('#routineTitle').value = routine?.title || '';
   $('#routineNotes').value = routine?.notes || '';
   const type = routine?.type || 'frequency';
-  state.selectedIconBackground = routineIconBackgroundOverride(routine?.id);
+  state.selectedIconBackground = routine?.icon_background || null;
   setSelectedType(type);
   setSelectedColor(routine?.color || 'lavender');
   state.selectedIconName = routine?.icon_name && routine.icon_name !== 'sparkles' ? routine.icon_name : suggestIconName(routine?.title || '');
@@ -856,7 +939,7 @@ async function saveRoutine(event) {
   const linkedToRoutineId = linked ? $('#linkedRoutine').value : null;
   const linkedOffsetDays = ($('#linkedDirection').value === 'before' ? -1 : 1) * Number($('#linkedDays').value || 0);
   if (linked && !linkedToRoutineId) return toast('Choose the routine this task should follow.', 'error');
-  let body = { title, notes: $('#routineNotes').value, color: state.selectedColor, iconName: state.selectedIconName, iconColor: resolveColor(state.selectedColor), type: state.selectedType, linkedToRoutineId, linkedOffsetDays };
+  let body = { title, notes: $('#routineNotes').value, color: state.selectedColor, iconName: state.selectedIconName, iconColor: resolveColor(state.selectedColor), iconBackground: state.selectedIconBackground, type: state.selectedType, linkedToRoutineId, linkedOffsetDays };
   if (state.selectedType === 'frequency') {
     const startAt = dateInputToIso($('#startAt').value);
     if (!startAt) return toast('Enter the start date as DD-MM-YYYY or choose it from the calendar.', 'error');
@@ -882,7 +965,7 @@ async function saveRoutine(event) {
   try {
     const result = await api(id ? `/api/routines/${encodeURIComponent(id)}` : '/api/routines', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(body) });
     const savedRoutineId = id || result.routine?.id;
-    if (savedRoutineId) persistRoutineIconBackground(savedRoutineId, state.selectedIconBackground);
+    if (savedRoutineId) removeLegacyRoutineIconBackground(savedRoutineId);
     closeRoutineModal();
     await loadBootstrap();
     if (state.activePage === 'calendar') await loadCalendar();
@@ -904,11 +987,12 @@ async function completeRoutine(id) {
 }
 async function archiveRoutine(id) {
   const routine = state.routines.find((r) => r.id === id);
-  if (!routine || !confirm(`Archive “${routine.title}”? Its history will be kept.`)) return;
+  if (!routine || !confirm(`Delete “${routine.title}”? All of its activity history and scheduled tasks will also be removed. This cannot be undone.`)) return;
   try {
     await api(`/api/routines/${encodeURIComponent(id)}`, { method: 'DELETE' });
     await loadBootstrap();
-    toast('Routine archived. Its completion history is preserved.');
+    if (state.activePage === 'history') await loadHistory();
+    toast('Routine deleted. Its activity history was removed.');
   } catch (error) { toast(error.message, 'error'); }
 }
 
@@ -1154,6 +1238,11 @@ async function unlinkGoogle() {
 }
 
 function installHandlers() {
+  $$('.brand').forEach((brand) => brand.addEventListener('click', (event) => {
+    event.preventDefault();
+    setPage(state.activePage === 'settings' ? settingsReturnPage : 'dashboard');
+  }));
+  $$('.brand-back-button').forEach((button) => button.addEventListener('click', () => setPage(settingsReturnPage)));
   $$('[data-page]').forEach((button) => button.addEventListener('click', () => setPage(button.dataset.page)));
   $$('[data-go-page]').forEach((button) => button.addEventListener('click', () => setPage(button.dataset.goPage)));
   $('#newRoutineButton').addEventListener('click', () => openRoutineModal());
@@ -1219,8 +1308,9 @@ function installHandlers() {
   $('#googleUnlinkButton').addEventListener('click', unlinkGoogle);
   $('#googleSwitchButton').addEventListener('click', () => { window.location.href = '/auth/google?switch=1'; });
   $('#mobileMenuButton')?.addEventListener('click', () => { const open = $('#sidebar').classList.toggle('open'); $('#mobileMenuButton').setAttribute('aria-expanded', String(open)); });
-  $('#mobileProfileButton')?.addEventListener('click', () => setPage('settings'));
-  $('#sidebarProfile')?.addEventListener('click', () => setPage('settings'));
+  const toggleProfileSettings = () => setPage(state.activePage === 'settings' ? settingsReturnPage : 'settings');
+  $('#mobileProfileButton')?.addEventListener('click', toggleProfileSettings);
+  $('#sidebarProfile')?.addEventListener('click', toggleProfileSettings);
   const handleCalendarSelection = (event) => {
     const completeButton = event.target.closest('[data-calendar-day-complete]');
     if (completeButton) {
@@ -1258,6 +1348,10 @@ function installHandlers() {
 }
 
 async function init() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/service-worker.js', { scope: '/' })
+      .catch((error) => console.warn('Routine Tracker could not register its offline app shell:', error));
+  }
   installHandlers();
   setupDateInputs();
   const todayText = formatDateText(localDateInput());
