@@ -15,7 +15,6 @@ if ! command -v npm >/dev/null 2>&1; then
 fi
 
 echo "Configuring Tailscale Funnel for Routine Tracker..."
-tailscale funnel reset
 tailscale funnel --https=443 --set-path=/ --bg http://127.0.0.1:4317
 
 echo "Starting Routine Tracker..."
