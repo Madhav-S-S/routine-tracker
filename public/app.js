@@ -29,6 +29,8 @@ const calendarLoadPromises = new Map();
 const calendarDataCache = new Map();
 let calendarDataRevision = 0;
 const DATA_CACHE_TTL_MS = 30000;
+const PERSISTENT_CACHE_PREFIX = 'routine-tracker.data-cache.v1';
+const PERSISTENT_CACHE_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 14;
 let historyCachedAt = 0;
 let historyHasLoaded = false;
 let lastBootstrapSnapshot = '';
@@ -119,6 +121,53 @@ const ICON_SUGGESTIONS = [
   [/coffee|tea/i, 'coffee'], [/pet|dog|cat/i, 'paw'], [/cycle|bike/i, 'bike'],
   [/calendar|plan|schedule/i, 'calendar'], [/photo|camera/i, 'camera']
 ];
+
+// The service worker caches the public app shell. These snapshots cache only
+// data for the browser's current opaque user id, then the API refreshes them
+// in the background. Keeping this in application storage (rather than the
+// service-worker HTTP cache) prevents one signed-in user receiving another
+// user's API response.
+function browserCacheUser() {
+  const match = document.cookie.match(/(?:^|;\s*)routine\.cache_user=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : '';
+}
+function persistentCacheKey(kind, suffix = '') {
+  const userId = browserCacheUser();
+  return userId ? `${PERSISTENT_CACHE_PREFIX}:${encodeURIComponent(userId)}:${kind}${suffix ? `:${suffix}` : ''}` : '';
+}
+function readPersistentCache(kind, suffix = '') {
+  const key = persistentCacheKey(kind, suffix);
+  if (!key) return null;
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || 'null');
+    if (!value || !value.savedAt || Date.now() - value.savedAt > PERSISTENT_CACHE_MAX_AGE_MS) {
+      if (value) localStorage.removeItem(key);
+      return null;
+    }
+    return value.data ?? null;
+  } catch { return null; }
+}
+function writePersistentCache(kind, data, suffix = '') {
+  const key = persistentCacheKey(kind, suffix);
+  if (!key) return;
+  try { localStorage.setItem(key, JSON.stringify({ savedAt: Date.now(), data })); }
+  catch (error) { console.warn(`Could not cache ${kind} data in this browser:`, error?.message || error); }
+}
+function primeCachedBootstrap() {
+  const data = readPersistentCache('bootstrap');
+  // Check the embedded id as well as the cache key in case a cookie was
+  // replaced while a tab was suspended.
+  if (!data || data.user?.id !== browserCacheUser()) return false;
+  state.csrfToken = data.csrfToken || '';
+  state.user = data.user;
+  state.routines = data.routines || [];
+  state.stats = data.stats || {};
+  state.google = data.google || { connected: false };
+  lastBootstrapSnapshot = JSON.stringify([state.user, state.routines, state.stats, state.google]);
+  renderAll();
+  setSyncState('syncing', 'Showing saved data · updating…');
+  return true;
+}
 
 
 function escapeHtml(value) {
@@ -400,6 +449,7 @@ function loadBootstrap(showError = true) {
       state.routines = data.routines || [];
       state.stats = data.stats || {};
       state.google = data.google || { connected: false };
+      if (data.user?.id === browserCacheUser()) writePersistentCache('bootstrap', data);
       const snapshot = JSON.stringify([state.user, state.routines, state.stats, state.google]);
       if (snapshot !== lastBootstrapSnapshot) {
         lastBootstrapSnapshot = snapshot;
@@ -596,7 +646,16 @@ function loadCalendar(options = {}) {
   const requestRevision = calendarDataRevision;
   const requestKey = `${month}:${requestRevision}${forceTaskRefresh ? ':force-tasks' : ''}`;
   if (calendarLoadPromises.has(requestKey)) return calendarLoadPromises.get(requestKey);
-  const cachedEntry = calendarDataCache.get(month);
+  let cachedEntry = calendarDataCache.get(month);
+  if (!cachedEntry) {
+    const saved = readPersistentCache('calendar', month);
+    if (saved) {
+      // Disk snapshots paint immediately, but are always reconciled with the
+      // server instead of being treated as a fresh in-memory response.
+      cachedEntry = { data: saved, cachedAt: 0 };
+      calendarDataCache.set(month, cachedEntry);
+    }
+  }
   if (cachedEntry) {
     state.calendarEvents = cachedEntry.data.events || [];
     state.calendarWarning = cachedEntry.data.syncWarning || null;
@@ -618,6 +677,7 @@ function loadCalendar(options = {}) {
       const data = await api(`/api/calendar?month=${encodeURIComponent(month)}${forceTaskRefresh ? '&refreshTasks=1' : ''}`);
       if (requestRevision === calendarDataRevision) {
         calendarDataCache.set(month, { data, cachedAt: Date.now() });
+        writePersistentCache('calendar', data, month);
         while (calendarDataCache.size > 4) calendarDataCache.delete(calendarDataCache.keys().next().value);
       }
       const currentMonth = `${state.calendarMonth.getFullYear()}-${String(state.calendarMonth.getMonth() + 1).padStart(2, '0')}`;
@@ -812,14 +872,30 @@ function renderCalendarGrid() {
   renderCalendarDayDetails();
 }
 
+function renderHistoryRows(rows) {
+  if (!rows.length) {
+    $('#historyList').innerHTML = '<div class="history-empty">Your completed routines will appear here. Complete a routine to get started.</div>';
+    return;
+  }
+  $('#historyList').innerHTML = rows.map((row) => `<div class="history-entry"><div class="history-mark">✓</div><div class="history-entry-copy"><strong>${escapeHtml(row.title)}</strong><small>${escapeHtml(row.note || 'Routine completed')}</small></div><div class="history-date">${formatDate(row.completed_at, { day: 'numeric', month: 'short' })} · ${formatDate(row.completed_at, { hour: 'numeric', minute: '2-digit' })}</div><button class="history-delete" type="button" data-action="delete-activity" data-id="${escapeHtml(row.id)}" aria-label="Delete activity" title="Delete activity">×</button></div>`).join('');
+}
+
 function loadHistory() {
   if (historyLoadPromise) return historyLoadPromise;
   if (historyHasLoaded && Date.now() - historyCachedAt < DATA_CACHE_TTL_MS) return Promise.resolve({ cached: true });
+  const saved = !historyHasLoaded ? readPersistentCache('history') : null;
+  if (Array.isArray(saved?.history)) {
+    renderHistoryRows(saved.history);
+    // A persistent snapshot is only for the first paint; keep fetching below.
+    historyHasLoaded = true;
+    historyCachedAt = 0;
+  }
   if (!$('#historyList').children.length) $('#historyList').innerHTML = '<div class="history-empty">Loading activity…</div>';
   const request = (async () => {
     try {
       const data = await api('/api/history?limit=100');
       const rows = data.history || [];
+      writePersistentCache('history', { history: rows });
       if (!rows.length) {
         $('#historyList').innerHTML = '<div class="history-empty">Your completed routines will appear here. Complete a routine to get started.</div>';
       } else {
@@ -1358,7 +1434,11 @@ async function init() {
   $('#startAt').value = todayText;
   $('#lastCompletedAt').value = todayText;
   $('#firstDueAt').value = todayText;
-  await loadBootstrap();
+  // Render the last known dashboard immediately on repeat launches. The live
+  // request is intentionally not awaited: it reconciles quietly in the
+  // background and re-renders only if something actually changed.
+  primeCachedBootstrap();
+  void loadBootstrap(false);
   lastForegroundRefreshAt = Date.now();
   const refreshForegroundData = async () => {
     if (document.hidden || foregroundRefreshRunning || Date.now() - lastForegroundRefreshAt < 15000) return;

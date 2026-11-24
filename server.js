@@ -401,6 +401,20 @@ app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 
+// This deliberately contains only the opaque local user id, never tokens or
+// profile data. The browser uses it to select the right private UI snapshot
+// before it refreshes from the API, so switching accounts cannot briefly show
+// the previous account's cached routines.
+function setBrowserCacheUser(res, userId) {
+  res.cookie('routine.cache_user', userId, {
+    httpOnly: false,
+    secure: COOKIE_SECURE,
+    sameSite: 'lax',
+    maxAge: SESSION_MAX_AGE,
+    path: '/'
+  });
+}
+
 // Static app files are public: serve them before SQLite session reads and cache
 // versioned resources locally so repeat launches do not refetch them.
 app.use(express.static(path.join(__dirname, 'public'), {
@@ -448,6 +462,7 @@ app.use((req, res, next) => {
     }
     if (!req.session.csrfToken) req.session.csrfToken = crypto.randomBytes(24).toString('hex');
     req.userId = req.session.userId;
+    setBrowserCacheUser(res, req.userId);
     next();
   } catch (error) { next(error); }
 });
@@ -1971,6 +1986,7 @@ app.get('/auth/google/callback', async (req, res, next) => {
     }
     req.session.userId = canonicalUserId;
     req.session.googleAccountKey = accountKey;
+    setBrowserCacheUser(res, canonicalUserId);
     req.session.save((saveError) => {
       if (saveError) return next(saveError);
       (async () => {
@@ -2385,6 +2401,7 @@ app.post('/api/google/unlink', (req, res) => {
   const freshUserId = createAnonymousUser();
   req.session.userId = freshUserId;
   delete req.session.googleAccountKey;
+  setBrowserCacheUser(res, freshUserId);
   res.json({ ok: true, message: 'Google has been disconnected from this browser session.' });
 });
 app.post('/api/drive/sync', async (req, res) => {
