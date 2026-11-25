@@ -2072,7 +2072,7 @@ app.delete('/api/routines/:id/task', async (req, res) => {
       const nextSlotKey = `frequency:${nextPeriod.start.toISOString()}:0`;
       // A calendar item can refer to the next period while the current period
       // is complete. Accept only that exact next slot, never an arbitrary key.
-      if (!item.maximumReached || requestedSlotKey !== nextSlotKey) {
+      if (!item.minimumReached || requestedSlotKey !== nextSlotKey) {
         return res.status(409).json({ error: 'That scheduled task is no longer the next occurrence. Refresh the calendar and try again.' });
       }
       slotKey = nextSlotKey;
@@ -2383,18 +2383,35 @@ app.get('/api/calendar', async (req, res) => {
         if (due >= start && due < end) events.push({ id: `due_${r.id}`, title: `${r.title} · due`, start: r.next_due_at, allDay: true, kind: 'due', routineId: r.id, color: r.color, linked: Boolean(r.linked_to_routine_id), available: due.getTime() <= Date.now() });
       }
       if (r.type === 'frequency') {
-        let opportunity = null;
-        let taskSlotKey = null;
-        let available = false;
+        // Keep the next current-period progressive slot visible, even when
+        // the minimum target has already been met and this is now an optional
+        // extra. Its task identity remains tied to the current period/count.
+        if (r.nextOpportunityAt && !r.maximumReached && !r.taskSuppressed) {
+          const currentOpportunity = new Date(r.nextOpportunityAt);
+          if (!Number.isNaN(currentOpportunity.getTime()) && currentOpportunity >= start && currentOpportunity < end) {
+            events.push({
+              id: `freq_${r.id}`,
+              title: `${r.title} · task`,
+              start: currentOpportunity.toISOString(),
+              allDay: true,
+              kind: 'frequency',
+              routineId: r.id,
+              color: r.color,
+              available: r.checkinAvailable,
+              taskSlotKey: r.taskSlotKey
+            });
+          }
+        }
 
-        if (r.maximumReached && r.periodEnd) {
-          // Once this period's maximum is complete, show the first task slot
-          // of the next anchored period instead of making the routine disappear
-          // from the calendar. Ask getCurrentPeriod for the next window so
-          // month-end and leap-year anchors retain their original cadence.
+        // Once the minimum target is reached, also preview the first task in
+        // the next anchored period. This is intentionally independent of the
+        // optional current-period slots, so a 2–3 per week routine can show
+        // both its third task this week and next week's first task.
+        if (r.minimumReached && r.periodEnd) {
           const nextPeriod = getCurrentPeriod(r, routineLocalMidnight(r.periodEnd));
           const nextBounds = routinePeriodInstants(nextPeriod);
-          taskSlotKey = `frequency:${nextPeriod.start.toISOString()}:0`;
+          const nextSlotKey = `frequency:${nextPeriod.start.toISOString()}:0`;
+          let nextOpportunity = null;
 
           const linkedDue = r.linked_to_routine_id && r.next_due_at ? new Date(r.next_due_at) : null;
           const linkedDoneForThisAnchor = Boolean(
@@ -2402,33 +2419,26 @@ app.get('/api/calendar', async (req, res) => {
             r.linked_completed_anchor === r.next_due_at
           );
           if (!linkedDoneForThisAnchor) {
-            opportunity = linkedDue
+            nextOpportunity = linkedDue
               ? new Date(Math.max(nextBounds.start.getTime(), linkedDue.getTime()))
               : nextBounds.start;
           }
-          if (opportunity && opportunity >= nextBounds.end) opportunity = null;
-          if (isRoutineTaskSuppressed(req.userId, r.id, taskSlotKey)) opportunity = null;
-          available = Boolean(opportunity && opportunity.getTime() <= Date.now());
-        } else if (r.nextOpportunityAt && !r.taskSuppressed) {
-          // Include the next progressive check-in even before it unlocks. The
-          // calendar marks it unavailable until its scheduled opportunity arrives.
-          opportunity = new Date(r.nextOpportunityAt);
-          taskSlotKey = r.taskSlotKey;
-          available = r.checkinAvailable;
-        }
+          if (nextOpportunity && nextOpportunity >= nextBounds.end) nextOpportunity = null;
+          if (isRoutineTaskSuppressed(req.userId, r.id, nextSlotKey)) nextOpportunity = null;
 
-        if (opportunity && !Number.isNaN(opportunity.getTime()) && opportunity >= start && opportunity < end) {
-          events.push({
-            id: `freq_${r.id}`,
-            title: `${r.title} · task`,
-            start: opportunity.toISOString(),
-            allDay: true,
-            kind: 'frequency',
-            routineId: r.id,
-            color: r.color,
-            available,
-            taskSlotKey
-          });
+          if (nextOpportunity && !Number.isNaN(nextOpportunity.getTime()) && nextOpportunity >= start && nextOpportunity < end) {
+            events.push({
+              id: `freq_next_${r.id}`,
+              title: `${r.title} · next task`,
+              start: nextOpportunity.toISOString(),
+              allDay: true,
+              kind: 'frequency',
+              routineId: r.id,
+              color: r.color,
+              available: nextOpportunity.getTime() <= Date.now(),
+              taskSlotKey: nextSlotKey
+            });
+          }
         }
       }
     }
