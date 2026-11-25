@@ -834,7 +834,8 @@ async function deleteCalendarDayItem(eventId) {
     if (isCompletion) {
       await api(`/api/history/${encodeURIComponent(item.completionId)}`, { method: 'DELETE' });
     } else {
-      await api(`/api/routines/${encodeURIComponent(item.routineId)}/task`, { method: 'DELETE' });
+      const slotQuery = item.taskSlotKey ? `?slotKey=${encodeURIComponent(item.taskSlotKey)}` : '';
+      await api(`/api/routines/${encodeURIComponent(item.routineId)}/task${slotQuery}`, { method: 'DELETE' });
     }
     await loadBootstrap();
     await loadCalendar();
