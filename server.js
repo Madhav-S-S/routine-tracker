@@ -2064,7 +2064,19 @@ app.delete('/api/routines/:id/task', async (req, res) => {
     const routine = db.prepare('SELECT * FROM routines WHERE id=? AND user_id=? AND archived=0').get(req.params.id, req.userId);
     if (!routine) return res.status(404).json({ error: 'Routine not found.' });
     const item = publicRoutine(routine);
-    const slotKey = routineTaskSlotKey(routine, item);
+    let slotKey = routineTaskSlotKey(routine, item);
+    const requestedSlotKey = typeof req.query.slotKey === 'string' ? req.query.slotKey : '';
+    if (routine.type === 'frequency' && requestedSlotKey && requestedSlotKey !== slotKey) {
+      const currentPeriod = getCurrentPeriod(routine);
+      const nextPeriod = getCurrentPeriod(routine, routineLocalMidnight(currentPeriod.end));
+      const nextSlotKey = `frequency:${nextPeriod.start.toISOString()}:0`;
+      // A calendar item can refer to the next period while the current period
+      // is complete. Accept only that exact next slot, never an arbitrary key.
+      if (!item.maximumReached || requestedSlotKey !== nextSlotKey) {
+        return res.status(409).json({ error: 'That scheduled task is no longer the next occurrence. Refresh the calendar and try again.' });
+      }
+      slotKey = nextSlotKey;
+    }
     if (!slotKey) return res.status(409).json({ error: 'There is no current task occurrence to delete.' });
     const account = getCurrentGoogleAccount(req.userId);
     const linkedTask = account
@@ -2370,12 +2382,53 @@ app.get('/api/calendar', async (req, res) => {
         const due = new Date(r.next_due_at);
         if (due >= start && due < end) events.push({ id: `due_${r.id}`, title: `${r.title} · due`, start: r.next_due_at, allDay: true, kind: 'due', routineId: r.id, color: r.color, linked: Boolean(r.linked_to_routine_id), available: due.getTime() <= Date.now() });
       }
-      if (r.type === 'frequency' && r.nextOpportunityAt && !r.maximumReached && !r.taskSuppressed) {
-        // Include the next progressive check-in even before it unlocks. The
-        // calendar marks it unavailable until its scheduled opportunity arrives.
-        const opportunity = new Date(r.nextOpportunityAt);
-        if (!Number.isNaN(opportunity.getTime()) && opportunity >= start && opportunity < end) {
-          events.push({ id: `freq_${r.id}`, title: `${r.title} · task`, start: opportunity.toISOString(), allDay: true, kind: 'frequency', routineId: r.id, color: r.color, available: r.checkinAvailable });
+      if (r.type === 'frequency') {
+        let opportunity = null;
+        let taskSlotKey = null;
+        let available = false;
+
+        if (r.maximumReached && r.periodEnd) {
+          // Once this period's maximum is complete, show the first task slot
+          // of the next anchored period instead of making the routine disappear
+          // from the calendar. Ask getCurrentPeriod for the next window so
+          // month-end and leap-year anchors retain their original cadence.
+          const nextPeriod = getCurrentPeriod(r, routineLocalMidnight(r.periodEnd));
+          const nextBounds = routinePeriodInstants(nextPeriod);
+          taskSlotKey = `frequency:${nextPeriod.start.toISOString()}:0`;
+
+          const linkedDue = r.linked_to_routine_id && r.next_due_at ? new Date(r.next_due_at) : null;
+          const linkedDoneForThisAnchor = Boolean(
+            r.linked_to_routine_id && r.linked_completed_anchor && r.next_due_at &&
+            r.linked_completed_anchor === r.next_due_at
+          );
+          if (!linkedDoneForThisAnchor) {
+            opportunity = linkedDue
+              ? new Date(Math.max(nextBounds.start.getTime(), linkedDue.getTime()))
+              : nextBounds.start;
+          }
+          if (opportunity && opportunity >= nextBounds.end) opportunity = null;
+          if (isRoutineTaskSuppressed(req.userId, r.id, taskSlotKey)) opportunity = null;
+          available = Boolean(opportunity && opportunity.getTime() <= Date.now());
+        } else if (r.nextOpportunityAt && !r.taskSuppressed) {
+          // Include the next progressive check-in even before it unlocks. The
+          // calendar marks it unavailable until its scheduled opportunity arrives.
+          opportunity = new Date(r.nextOpportunityAt);
+          taskSlotKey = r.taskSlotKey;
+          available = r.checkinAvailable;
+        }
+
+        if (opportunity && !Number.isNaN(opportunity.getTime()) && opportunity >= start && opportunity < end) {
+          events.push({
+            id: `freq_${r.id}`,
+            title: `${r.title} · task`,
+            start: opportunity.toISOString(),
+            allDay: true,
+            kind: 'frequency',
+            routineId: r.id,
+            color: r.color,
+            available,
+            taskSlotKey
+          });
         }
       }
     }
