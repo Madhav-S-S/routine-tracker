@@ -116,7 +116,8 @@ db.exec(`
     routine_id TEXT NOT NULL REFERENCES routines(id),
     user_id TEXT NOT NULL REFERENCES users(id),
     completed_at TEXT NOT NULL,
-    note TEXT NOT NULL DEFAULT ''
+    note TEXT NOT NULL DEFAULT '',
+    frequency_period_start TEXT
   );
 
   CREATE TABLE IF NOT EXISTS google_tasks (
@@ -173,6 +174,7 @@ ensureColumn('routines', 'linked_offset_days', 'INTEGER NOT NULL DEFAULT -1');
 ensureColumn('routines', 'linked_completed_anchor', 'TEXT');
 ensureColumn('google_events', 'description', 'TEXT');
 ensureColumn('google_tasks', 'completion_id', 'TEXT');
+ensureColumn('completions', 'frequency_period_start', 'TEXT');
 ensureColumn('google_tasks', 'remote_updated_at', 'TEXT');
 ensureColumn('google_tasks', 'legacy_probe_done', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('google_accounts', 'last_task_sync', 'TEXT');
@@ -333,8 +335,7 @@ function getRoutineAnchorDate(routine, now = new Date()) {
   if (routine.type !== 'frequency') return null;
   const window = getCurrentPeriod(routine, now);
   const bounds = routinePeriodInstants(window);
-  const count = db.prepare(`SELECT COUNT(*) AS n FROM completions WHERE routine_id=? AND completed_at>=? AND completed_at<?`)
-    .get(routine.id, bounds.start.toISOString(), bounds.end.toISOString()).n;
+  const count = frequencyCompletionCount(routine.id, bounds);
   const maxCount = Math.max(1, Number(routine.max_count || 1));
   if (Number(count || 0) >= maxCount) return bounds.end;
   if (!parseBooleanFlag(routine.progressive, true)) return bounds.start;
@@ -581,6 +582,54 @@ function routineTaskSlotKey(routine, item = null) {
   }
   return null;
 }
+function frequencyPeriodStartFromTaskSlot(slotKey) {
+  const match = String(slotKey || '').match(/^frequency:(.+):\d+$/);
+  if (!match) return null;
+  const date = new Date(match[1]);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+function frequencyCompletionCount(routineId, bounds) {
+  const periodStart = bounds.start.toISOString();
+  const periodEnd = bounds.end.toISOString();
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM completions
+    WHERE routine_id=? AND (
+      frequency_period_start=?
+      OR (frequency_period_start IS NULL AND completed_at>=? AND completed_at<?)
+    )`).get(routineId, periodStart, periodStart, periodEnd);
+  return Number(row?.n || 0);
+}
+function nextFrequencyTask(routine, publicItem = null) {
+  if (!routine || routine.type !== 'frequency') return null;
+  const item = publicItem || publicRoutine(routine);
+  if (!item.minimumReached || !item.periodEnd) return null;
+
+  const nextPeriod = getCurrentPeriod(routine, routineLocalMidnight(item.periodEnd));
+  const bounds = routinePeriodInstants(nextPeriod);
+  const completedCount = frequencyCompletionCount(routine.id, bounds);
+  const maxCount = Math.max(1, Number(routine.max_count || 1));
+  if (completedCount >= maxCount) return null;
+
+  const duration = Math.max(1, bounds.end.getTime() - bounds.start.getTime());
+  const progressive = parseBooleanFlag(routine.progressive, true);
+  const scheduled = progressive
+    ? new Date(bounds.start.getTime() + duration * (completedCount / maxCount))
+    : bounds.start;
+  const linkedDue = routine.linked_to_routine_id && routine.next_due_at ? new Date(routine.next_due_at) : null;
+  const linkedDoneForThisAnchor = Boolean(
+    routine.linked_to_routine_id && routine.linked_completed_anchor && routine.next_due_at &&
+    routine.linked_completed_anchor === routine.next_due_at
+  );
+  if (linkedDoneForThisAnchor) return null;
+
+  const opportunity = linkedDue
+    ? new Date(Math.max(scheduled.getTime(), linkedDue.getTime()))
+    : scheduled;
+  if (opportunity >= bounds.end) return null;
+
+  const slotKey = `frequency:${nextPeriod.start.toISOString()}:${completedCount}`;
+  if (isRoutineTaskSuppressed(routine.user_id, routine.id, slotKey)) return null;
+  return { dueDate: routineDateOnly(opportunity), start: opportunity.toISOString(), slotKey };
+}
 
 // A stable marker travels with each task in Google Tasks. Separate SQLite
 // installations can therefore rediscover the same remote task instead of
@@ -648,9 +697,7 @@ function recalculateRoutineAfterGoogleTaskChange(userId, routineId) {
   if (refreshed?.type === 'frequency' && refreshed.linked_to_routine_id) {
     const period = getCurrentPeriod(refreshed);
     const bounds = routinePeriodInstants(period);
-    const count = db.prepare(`SELECT COUNT(*) AS n FROM completions
-      WHERE routine_id=? AND completed_at>=? AND completed_at<?`)
-      .get(routineId, bounds.start.toISOString(), bounds.end.toISOString()).n;
+    const count = frequencyCompletionCount(routineId, bounds);
     if (Number(count) < Number(refreshed.max_count || 1) && refreshed.linked_completed_anchor) {
       db.prepare('UPDATE routines SET linked_completed_anchor=NULL,updated_at=? WHERE id=? AND user_id=?')
         .run(nowIso(), routineId, userId);
@@ -704,15 +751,18 @@ function applyRemoteGoogleTaskUpdate(userId, account, localTask, remote, changed
         .run(userId, routine.id, localTask.slot_key);
     }
     const completedAt = toIso(remote.completed, toIso(remote.updated, nowIso()));
+    const frequencyPeriodStart = routine.type === 'frequency'
+      ? frequencyPeriodStartFromTaskSlot(localTask.slot_key) : null;
     let completionId = localTask.completion_id;
     let existingCompletion = completionId
-      ? db.prepare('SELECT id,completed_at FROM completions WHERE id=? AND user_id=?').get(completionId, userId)
+      ? db.prepare('SELECT id,completed_at,frequency_period_start FROM completions WHERE id=? AND user_id=?').get(completionId, userId)
       : null;
 
     if (!existingCompletion) {
-      const possibleMatch = db.prepare(`SELECT id,completed_at FROM completions
-        WHERE routine_id=? ORDER BY ABS(strftime('%s',completed_at)-strftime('%s',?)) LIMIT 1`)
-        .get(routine.id, completedAt);
+      const possibleMatch = db.prepare(`SELECT id,completed_at,frequency_period_start FROM completions
+        WHERE routine_id=? AND (frequency_period_start=? OR frequency_period_start IS NULL)
+        ORDER BY ABS(strftime('%s',completed_at)-strftime('%s',?)) LIMIT 1`)
+        .get(routine.id, frequencyPeriodStart, completedAt);
       if (possibleMatch && Math.abs(new Date(possibleMatch.completed_at).getTime() - new Date(completedAt).getTime()) <= 5 * 60 * 1000) {
         completionId = possibleMatch.id;
         existingCompletion = possibleMatch;
@@ -721,14 +771,15 @@ function applyRemoteGoogleTaskUpdate(userId, account, localTask, remote, changed
 
     if (!existingCompletion && !routine.archived) {
       completionId = makeId('done');
-      db.prepare('INSERT INTO completions(id,routine_id,user_id,completed_at,note) VALUES(?,?,?,?,?)')
-        .run(completionId, routine.id, userId, completedAt, 'Completed in Google Tasks');
+      db.prepare('INSERT INTO completions(id,routine_id,user_id,completed_at,note,frequency_period_start) VALUES(?,?,?,?,?,?)')
+        .run(completionId, routine.id, userId, completedAt, 'Completed in Google Tasks', frequencyPeriodStart);
       changedRoutines.add(routine.id);
     } else if (existingCompletion) {
       completionId = existingCompletion.id;
-      if (existingCompletion.completed_at !== completedAt) {
-        db.prepare('UPDATE completions SET completed_at=? WHERE id=? AND user_id=?')
-          .run(completedAt, completionId, userId);
+      if (existingCompletion.completed_at !== completedAt ||
+          (frequencyPeriodStart && existingCompletion.frequency_period_start !== frequencyPeriodStart)) {
+        db.prepare('UPDATE completions SET completed_at=?,frequency_period_start=COALESCE(frequency_period_start,?) WHERE id=? AND user_id=?')
+          .run(completedAt, frequencyPeriodStart, completionId, userId);
         changedRoutines.add(routine.id);
       }
       if (localTask.status !== 'completed') changedRoutines.add(routine.id);
@@ -1074,26 +1125,32 @@ async function syncRoutineTasks(userId, routineIds = null, options = {}) {
     }
 
     for (const routine of routines) {
-      let dueDate = null;
-      let slotKey = '';
+      const desiredSlots = [];
       if (routine.type === 'interval' && routine.next_due_at) {
         if (routine.linked_to_routine_id && routine.last_completed_at &&
             new Date(routine.last_completed_at).getTime() >= new Date(routine.next_due_at).getTime()) continue;
-        dueDate = routineDateOnly(routine.next_due_at);
-        slotKey = routineTaskSlotKey(routine);
-      } else if (routine.type === 'frequency' && routine.checkinAvailable) {
-        // Publish against the fixed slot date, not the day a background sync runs.
-        dueDate = routineDateOnly(routine.nextOpportunityAt || nowIso());
-        slotKey = routineTaskSlotKey(routine);
+        desiredSlots.push({ dueDate: routineDateOnly(routine.next_due_at), slotKey: routineTaskSlotKey(routine) });
+      } else if (routine.type === 'frequency') {
+        if (!routine.maximumReached && routine.nextOpportunityAt) {
+          desiredSlots.push({
+            dueDate: routineDateOnly(routine.nextOpportunityAt),
+            slotKey: routineTaskSlotKey(routine)
+          });
+        }
+        const nextTask = nextFrequencyTask(routine, routine);
+        if (nextTask) desiredSlots.push(nextTask);
       }
-      if (!dueDate || !slotKey) continue;
-      if (isRoutineTaskSuppressed(userId, routine.id, slotKey)) continue;
+
+      for (const desired of desiredSlots) {
+        const dueDate = desired.dueDate;
+        const slotKey = desired.slotKey;
+        if (!dueDate || !slotKey || isRoutineTaskSuppressed(userId, routine.id, slotKey)) continue;
 
       let existing = db.prepare('SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=?')
         .get(account.account_key, routine.id, slotKey);
       if (!existing) {
-        existing = db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='needsAction' ORDER BY updated_at DESC LIMIT 1")
-          .get(account.account_key, routine.id);
+        existing = db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='needsAction' AND due_date=? ORDER BY updated_at DESC LIMIT 1")
+          .get(account.account_key, routine.id, dueDate);
       }
 
       const marker = routineTaskMarker(routine.id, slotKey);
@@ -1184,6 +1241,7 @@ async function syncRoutineTasks(userId, routineIds = null, options = {}) {
           'needsAction', nowIso(), toIso(created.data?.updated, null));
       if (remoteTaskSnapshot) remoteTaskSnapshot.push(created.data);
       mappingsChanged = true;
+      }
     }
     if (mappingsChanged) queueDriveSync(userId);
     return { synced: true, mappingsUpdated: mappingsChanged };
@@ -1247,10 +1305,12 @@ function queueTaskPullSync(userId) {
   taskPullQueues.set(userId, timer);
 }
 
-async function completeCurrentGoogleTask(userId, routine) {
+async function completeCurrentGoogleTask(userId, routine, slotKey = null) {
   const account = getCurrentGoogleAccount(userId);
   if (!account) return;
-  const row = db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='needsAction' ORDER BY updated_at DESC LIMIT 1").get(account.account_key, routine.id);
+  const row = slotKey
+    ? db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=? AND status='needsAction'").get(account.account_key, routine.id, slotKey)
+    : db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='needsAction' ORDER BY updated_at DESC LIMIT 1").get(account.account_key, routine.id);
   if (!row) return;
   const patched = await tasksApi(account.account_key).tasks.patch({ tasklist: '@default', task: row.task_id, requestBody: { status: 'completed', completed: nowIso() } });
   db.prepare('UPDATE google_tasks SET status=?,remote_updated_at=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
@@ -1266,9 +1326,7 @@ function publicRoutine(routine, now = new Date(), context = null) {
     const bounds = routinePeriodInstants(window);
     const count = context?.completionCounts.has(routine.id)
       ? context.completionCounts.get(routine.id)
-      : db.prepare(`SELECT COUNT(*) AS n FROM completions
-          WHERE routine_id = ? AND completed_at >= ? AND completed_at < ?`)
-          .get(routine.id, bounds.start.toISOString(), bounds.end.toISOString()).n;
+      : frequencyCompletionCount(routine.id, bounds);
     const duration = Math.max(1, bounds.end.getTime() - bounds.start.getTime());
     const hasStarted = now.getTime() >= bounds.start.getTime();
     const elapsedFraction = Math.max(0, Math.min(1, (now.getTime() - bounds.start.getTime()) / duration));
@@ -1367,8 +1425,10 @@ function listRoutines(userId, includeArchived = false) {
       FROM period_bounds p
       LEFT JOIN completions c
         ON c.routine_id=p.routine_id
-        AND c.completed_at>=p.period_start
-        AND c.completed_at<p.period_end
+        AND (
+          c.frequency_period_start=p.period_start
+          OR (c.frequency_period_start IS NULL AND c.completed_at>=p.period_start AND c.completed_at<p.period_end)
+        )
       GROUP BY p.routine_id`).all(...params);
     for (const row of counts) completionCounts.set(row.routine_id, Number(row.completion_count || 0));
   }
@@ -1683,8 +1743,9 @@ async function restoreDriveBackup(userId, options = {}) {
       if (!targetRoutineId) continue;
       const existingCompletion = db.prepare('SELECT user_id FROM completions WHERE id = ?').get(String(c.id));
       const targetCompletionId = existingCompletion && existingCompletion.user_id !== userId ? makeId('done') : String(c.id);
-      db.prepare('INSERT OR IGNORE INTO completions(id,routine_id,user_id,completed_at,note) VALUES(?,?,?,?,?)')
-        .run(targetCompletionId, targetRoutineId, userId, String(c.completed_at), String(c.note || ''));
+      db.prepare('INSERT OR IGNORE INTO completions(id,routine_id,user_id,completed_at,note,frequency_period_start) VALUES(?,?,?,?,?,?)')
+        .run(targetCompletionId, targetRoutineId, userId, String(c.completed_at), String(c.note || ''),
+          c.frequency_period_start || null);
       completionCount++;
     }
 
@@ -2067,15 +2128,13 @@ app.delete('/api/routines/:id/task', async (req, res) => {
     let slotKey = routineTaskSlotKey(routine, item);
     const requestedSlotKey = typeof req.query.slotKey === 'string' ? req.query.slotKey : '';
     if (routine.type === 'frequency' && requestedSlotKey && requestedSlotKey !== slotKey) {
-      const currentPeriod = getCurrentPeriod(routine);
-      const nextPeriod = getCurrentPeriod(routine, routineLocalMidnight(currentPeriod.end));
-      const nextSlotKey = `frequency:${nextPeriod.start.toISOString()}:0`;
-      // A calendar item can refer to the next period while the current period
-      // is complete. Accept only that exact next slot, never an arbitrary key.
-      if (!item.minimumReached || requestedSlotKey !== nextSlotKey) {
+      const nextTask = nextFrequencyTask(routine, item);
+      // A calendar item can refer to the upcoming period. Accept only the exact
+      // next slot calculated from its completed count, never an arbitrary key.
+      if (!nextTask || requestedSlotKey !== nextTask.slotKey) {
         return res.status(409).json({ error: 'That scheduled task is no longer the next occurrence. Refresh the calendar and try again.' });
       }
-      slotKey = nextSlotKey;
+      slotKey = nextTask.slotKey;
     }
     if (!slotKey) return res.status(409).json({ error: 'There is no current task occurrence to delete.' });
     const account = getCurrentGoogleAccount(req.userId);
@@ -2149,14 +2208,46 @@ app.post('/api/routines/:id/complete', async (req, res) => {
     const routine = db.prepare('SELECT * FROM routines WHERE id = ? AND user_id = ? AND archived = 0').get(req.params.id, req.userId);
     if (!routine) return res.status(404).json({ error: 'Routine not found.' });
     const publicBefore = publicRoutine(routine);
-    if (routine.type === 'frequency' && publicBefore.maximumReached) return res.status(409).json({ error: 'You have already reached the maximum for this period.' });
-    if (routine.type === 'interval' && !publicBefore.isDue) return res.status(409).json({ error: 'This routine is not due yet.' });
+    const requestedSlotKey = typeof req.body.taskSlotKey === 'string' ? req.body.taskSlotKey.trim() : '';
+    let frequencyPeriodStart = null;
+
+    if (routine.type === 'frequency') {
+      const currentSlotKey = routineTaskSlotKey(routine, publicBefore);
+      const isCurrentSlot = !publicBefore.maximumReached &&
+        (!requestedSlotKey || requestedSlotKey === currentSlotKey);
+      const upcomingSlot = requestedSlotKey ? nextFrequencyTask(routine, publicBefore) : null;
+      const isUpcomingSlot = Boolean(upcomingSlot && upcomingSlot.slotKey === requestedSlotKey);
+      if (!isCurrentSlot && !isUpcomingSlot) {
+        return res.status(409).json({ error: 'This frequency task is no longer available. Refresh the calendar and try again.' });
+      }
+      if (requestedSlotKey && isRoutineTaskSuppressed(req.userId, routine.id, requestedSlotKey)) {
+        return res.status(409).json({ error: 'This scheduled task was deleted. Refresh the calendar and try again.' });
+      }
+      frequencyPeriodStart = isUpcomingSlot
+        ? frequencyPeriodStartFromTaskSlot(requestedSlotKey)
+        : publicBefore.periodStart;
+    } else {
+      const currentSlotKey = routineTaskSlotKey(routine, publicBefore);
+      if (requestedSlotKey) {
+        if (requestedSlotKey !== currentSlotKey ||
+            isRoutineTaskSuppressed(req.userId, routine.id, requestedSlotKey)) {
+          return res.status(409).json({ error: 'This repeat-after task is no longer available. Refresh the calendar and try again.' });
+        }
+      } else if (!publicBefore.isDue) {
+        return res.status(409).json({ error: 'This routine is not due yet.' });
+      }
+    }
+
+    const completionSlotKey = requestedSlotKey || publicBefore.taskSlotKey;
     let completedGoogleTask = null;
-    try { completedGoogleTask = await completeCurrentGoogleTask(req.userId, publicRoutine(routine)); } catch (error) { console.warn('Could not complete Google Task:', error.message); }
+    try {
+      completedGoogleTask = await completeCurrentGoogleTask(req.userId, routine, completionSlotKey);
+    } catch (error) { console.warn('Could not complete Google Task:', error.message); }
     const completedAt = toIso(req.body.completedAt, nowIso());
     const completionId = makeId('done');
-    db.prepare('INSERT INTO completions(id,routine_id,user_id,completed_at,note) VALUES(?,?,?,?,?)')
-      .run(completionId, routine.id, req.userId, completedAt, String(req.body.note || '').slice(0, 500));
+    db.prepare('INSERT INTO completions(id,routine_id,user_id,completed_at,note,frequency_period_start) VALUES(?,?,?,?,?,?)')
+      .run(completionId, routine.id, req.userId, completedAt,
+        String(req.body.note || '').slice(0, 500), frequencyPeriodStart);
     if (completedGoogleTask) db.prepare('UPDATE google_tasks SET completion_id=? WHERE account_key=? AND routine_id=? AND slot_key=?')
       .run(completionId, completedGoogleTask.account_key, routine.id, completedGoogleTask.slot_key);
     if (routine.type === 'interval' && !routine.linked_to_routine_id) {
@@ -2228,8 +2319,7 @@ app.delete('/api/history/:id', async (req, res) => {
   if (routine && routine.type === 'frequency') {
     const currentPeriod = getCurrentPeriod(routine);
     const periodBounds = routinePeriodInstants(currentPeriod);
-    const count = db.prepare('SELECT COUNT(*) AS n FROM completions WHERE routine_id=? AND completed_at>=? AND completed_at<?')
-      .get(routine.id, periodBounds.start.toISOString(), periodBounds.end.toISOString()).n;
+    const count = frequencyCompletionCount(routine.id, periodBounds);
     if (routine.linked_to_routine_id && Number(count) < Number(routine.max_count || 1)) {
       db.prepare('UPDATE routines SET linked_completed_anchor=NULL,updated_at=? WHERE id=?').run(nowIso(), routine.id);
     }
@@ -2330,6 +2420,7 @@ app.get('/api/calendar', async (req, res) => {
     const account = getCurrentGoogleAccount(req.userId);
     let syncWarning = null;
     if (account) {
+      queueRoutineTaskPublish(req.userId);
       queueTaskPullSync(req.userId);
       const forceTaskRefresh = req.query.refreshTasks === '1';
       const monthSync = syncGoogleManualTasksForMonth(req.userId, account, month, forceTaskRefresh);
@@ -2380,7 +2471,7 @@ app.get('/api/calendar', async (req, res) => {
     for (const r of routines) {
       if (r.type === 'interval' && r.next_due_at && !r.taskSuppressed && !(r.linked_to_routine_id && r.last_completed_at && new Date(r.last_completed_at) >= new Date(r.next_due_at))) {
         const due = new Date(r.next_due_at);
-        if (due >= start && due < end) events.push({ id: `due_${r.id}`, title: `${r.title} · due`, start: r.next_due_at, allDay: true, kind: 'due', routineId: r.id, color: r.color, linked: Boolean(r.linked_to_routine_id), available: due.getTime() <= Date.now() });
+        if (due >= start && due < end) events.push({ id: `due_${r.id}`, title: `${r.title} · due`, start: r.next_due_at, allDay: true, kind: 'due', routineId: r.id, color: r.color, linked: Boolean(r.linked_to_routine_id), available: true, taskSlotKey: r.taskSlotKey });
       }
       if (r.type === 'frequency') {
         // Keep the next current-period progressive slot visible, even when
@@ -2397,7 +2488,7 @@ app.get('/api/calendar', async (req, res) => {
               kind: 'frequency',
               routineId: r.id,
               color: r.color,
-              available: r.checkinAvailable,
+              available: true,
               taskSlotKey: r.taskSlotKey
             });
           }
@@ -2407,36 +2498,20 @@ app.get('/api/calendar', async (req, res) => {
         // the next anchored period. This is intentionally independent of the
         // optional current-period slots, so a 2–3 per week routine can show
         // both its third task this week and next week's first task.
-        if (r.minimumReached && r.periodEnd) {
-          const nextPeriod = getCurrentPeriod(r, routineLocalMidnight(r.periodEnd));
-          const nextBounds = routinePeriodInstants(nextPeriod);
-          const nextSlotKey = `frequency:${nextPeriod.start.toISOString()}:0`;
-          let nextOpportunity = null;
-
-          const linkedDue = r.linked_to_routine_id && r.next_due_at ? new Date(r.next_due_at) : null;
-          const linkedDoneForThisAnchor = Boolean(
-            r.linked_to_routine_id && r.linked_completed_anchor && r.next_due_at &&
-            r.linked_completed_anchor === r.next_due_at
-          );
-          if (!linkedDoneForThisAnchor) {
-            nextOpportunity = linkedDue
-              ? new Date(Math.max(nextBounds.start.getTime(), linkedDue.getTime()))
-              : nextBounds.start;
-          }
-          if (nextOpportunity && nextOpportunity >= nextBounds.end) nextOpportunity = null;
-          if (isRoutineTaskSuppressed(req.userId, r.id, nextSlotKey)) nextOpportunity = null;
-
-          if (nextOpportunity && !Number.isNaN(nextOpportunity.getTime()) && nextOpportunity >= start && nextOpportunity < end) {
+        const nextTask = nextFrequencyTask(r, r);
+        if (nextTask) {
+          const nextOpportunity = new Date(nextTask.start);
+          if (!Number.isNaN(nextOpportunity.getTime()) && nextOpportunity >= start && nextOpportunity < end) {
             events.push({
               id: `freq_next_${r.id}`,
               title: `${r.title} · next task`,
-              start: nextOpportunity.toISOString(),
+              start: nextTask.start,
               allDay: true,
               kind: 'frequency',
               routineId: r.id,
               color: r.color,
-              available: nextOpportunity.getTime() <= Date.now(),
-              taskSlotKey: nextSlotKey
+              available: true,
+              taskSlotKey: nextTask.slotKey
             });
           }
         }
