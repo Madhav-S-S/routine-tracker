@@ -688,6 +688,19 @@ function recalculateRoutineAfterGoogleTaskChange(userId, routineId) {
       : nowIso();
     db.prepare('UPDATE routines SET last_completed_at=?,next_due_at=?,updated_at=? WHERE id=? AND user_id=?')
       .run(lastCompletedAt, nextDueAt, nowIso(), routineId, userId);
+  } else if (routine.type === 'interval' && routine.linked_to_routine_id) {
+    const account = getCurrentGoogleAccount(userId);
+    const slotKey = routine.next_due_at ? routineTaskSlotKey(routine) : null;
+    const mappedTask = account && slotKey
+      ? db.prepare('SELECT status FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=?')
+        .get(account.account_key, routineId, slotKey)
+      : null;
+    const completedForCurrentOccurrence = Boolean(
+      (mappedTask && mappedTask.status === 'completed') ||
+      (lastCompletedAt && routine.next_due_at && new Date(lastCompletedAt) >= new Date(routine.next_due_at))
+    );
+    db.prepare('UPDATE routines SET last_completed_at=?,linked_completed_anchor=CASE WHEN ? THEN next_due_at ELSE NULL END,updated_at=? WHERE id=? AND user_id=?')
+      .run(lastCompletedAt, completedForCurrentOccurrence ? 1 : 0, nowIso(), routineId, userId);
   } else {
     db.prepare('UPDATE routines SET last_completed_at=?,updated_at=? WHERE id=? AND user_id=?')
       .run(lastCompletedAt, nowIso(), routineId, userId);
@@ -1138,8 +1151,10 @@ async function syncRoutineTasks(userId, routineIds = null, options = {}) {
     for (const routine of routines) {
       const desiredSlots = [];
       if (routine.type === 'interval' && routine.next_due_at) {
-        if (routine.linked_to_routine_id && routine.last_completed_at &&
-            new Date(routine.last_completed_at).getTime() >= new Date(routine.next_due_at).getTime()) continue;
+        if (routine.linked_to_routine_id && (
+          routine.linked_completed_anchor === routine.next_due_at ||
+          (routine.last_completed_at && new Date(routine.last_completed_at).getTime() >= new Date(routine.next_due_at).getTime())
+        )) continue;
         desiredSlots.push({ dueDate: routineDateOnly(routine.next_due_at), slotKey: routineTaskSlotKey(routine) });
       } else if (routine.type === 'frequency') {
         if (!routine.maximumReached && routine.nextOpportunityAt) {
@@ -1386,7 +1401,12 @@ function publicRoutine(routine, now = new Date(), context = null) {
     }
   } else {
     const due = routine.next_due_at ? new Date(routine.next_due_at) : null;
-    const alreadyDoneForLinkedOccurrence = Boolean(routine.linked_to_routine_id && routine.last_completed_at && due && new Date(routine.last_completed_at) >= due);
+    const alreadyDoneForLinkedOccurrence = Boolean(
+      routine.linked_to_routine_id && due && (
+        routine.linked_completed_anchor === routine.next_due_at ||
+        (routine.last_completed_at && new Date(routine.last_completed_at) >= due)
+      )
+    );
     item.isDue = due ? (due.getTime() <= now.getTime() && !alreadyDoneForLinkedOccurrence) : !routine.linked_to_routine_id;
     item.daysUntilDue = due ? Math.ceil((due.getTime() - now.getTime()) / 86400000) : 0;
     if (routine.linked_to_routine_id) {
@@ -2267,7 +2287,7 @@ app.post('/api/routines/:id/complete', async (req, res) => {
         .run(completedAt, nextDueAt, nowIso(), routine.id);
       updateLinkedRoutineSchedules(req.userId, routine.id);
     } else if (routine.type === 'interval' && routine.linked_to_routine_id) {
-      db.prepare('UPDATE routines SET last_completed_at=?,updated_at=? WHERE id=?').run(completedAt, nowIso(), routine.id);
+      db.prepare('UPDATE routines SET last_completed_at=?,linked_completed_anchor=next_due_at,updated_at=? WHERE id=?').run(completedAt, nowIso(), routine.id);
     } else {
       db.prepare('UPDATE routines SET last_completed_at=?,updated_at=? WHERE id=?').run(completedAt, nowIso(), routine.id);
     }
@@ -2325,7 +2345,12 @@ app.delete('/api/history/:id', async (req, res) => {
     updateLinkedRoutineSchedules(req.userId, routine.id);
   } else if (routine && routine.type === 'interval' && routine.linked_to_routine_id) {
     const latest = db.prepare('SELECT completed_at FROM completions WHERE routine_id=? ORDER BY completed_at DESC LIMIT 1').get(routine.id);
-    db.prepare('UPDATE routines SET last_completed_at=?,updated_at=? WHERE id=?').run(latest?.completed_at || null, nowIso(), routine.id);
+    const deletedCurrentOccurrence = Boolean(
+      (linkedTask && linkedTask.slot_key === routineTaskSlotKey(routine)) ||
+      (latest && latest.completed_at === row.completed_at)
+    );
+    db.prepare('UPDATE routines SET last_completed_at=?,linked_completed_anchor=CASE WHEN ? THEN NULL ELSE linked_completed_anchor END,updated_at=? WHERE id=?')
+      .run(latest?.completed_at || null, deletedCurrentOccurrence ? 1 : 0, nowIso(), routine.id);
   }
   if (routine && routine.type === 'frequency') {
     const currentPeriod = getCurrentPeriod(routine);
@@ -2480,7 +2505,11 @@ app.get('/api/calendar', async (req, res) => {
     }
     const routines = listRoutines(req.userId);
     for (const r of routines) {
-      if (r.type === 'interval' && r.next_due_at && !r.taskSuppressed && !(r.linked_to_routine_id && r.last_completed_at && new Date(r.last_completed_at) >= new Date(r.next_due_at))) {
+      if (r.type === 'interval' && r.next_due_at && !r.taskSuppressed &&
+          !(r.linked_to_routine_id && (
+            r.linked_completed_anchor === r.next_due_at ||
+            (r.last_completed_at && new Date(r.last_completed_at) >= new Date(r.next_due_at))
+          ))) {
         const due = new Date(r.next_due_at);
         if (due >= start && due < end) events.push({ id: `due_${r.id}`, title: `${r.title} · due`, start: r.next_due_at, allDay: true, kind: 'due', routineId: r.id, color: r.color, linked: Boolean(r.linked_to_routine_id), available: true, taskSlotKey: r.taskSlotKey });
       }
