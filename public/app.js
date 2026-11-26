@@ -759,7 +759,7 @@ function renderCalendarDayDetails() {
       const isRoutineTask = ['due', 'frequency'].includes(event.kind) && event.routineId;
       const canEditDate = Boolean(isCompletion || (event.kind === 'due' && !event.linked));
       const canDelete = Boolean(isCompletion || isRoutineTask);
-      const canComplete = Boolean(isRoutineTask && event.available !== false);
+      const canComplete = Boolean(isRoutineTask);
       const googleLink = ['google', 'google-task'].includes(event.kind) && event.url
         ? `<a class="calendar-day-open-link" href="${escapeHtml(event.url)}" target="_blank" rel="noopener">Open in Google ↗</a>` : '';
       const dateControl = canEditDate
@@ -820,8 +820,7 @@ async function saveCalendarDayItemDate(eventId, rawDate) {
 async function completeCalendarDayItem(eventId) {
   const item = state.calendarEvents.find((row) => row.id === eventId);
   if (!item || !item.routineId || !['due', 'frequency'].includes(item.kind)) return;
-  if (item.available === false) return toast('This task is not available yet.', 'error');
-  await completeRoutine(item.routineId);
+  await completeRoutine(item.routineId, { taskSlotKey: item.taskSlotKey });
 }
 async function deleteCalendarDayItem(eventId) {
   const item = state.calendarEvents.find((row) => row.id === eventId);
@@ -1051,12 +1050,15 @@ async function saveRoutine(event) {
   finally { button.disabled = false; button.innerHTML = 'Save routine <span>→</span>'; }
 }
 
-async function completeRoutine(id) {
+async function completeRoutine(id, options = {}) {
   const routine = state.routines.find((r) => r.id === id);
   if (!routine) return;
   setSyncState('syncing', 'Saving completion');
   try {
-    await api(`/api/routines/${encodeURIComponent(id)}/complete`, { method: 'POST', body: JSON.stringify({}) });
+    await api(`/api/routines/${encodeURIComponent(id)}/complete`, {
+      method: 'POST',
+      body: JSON.stringify(options.taskSlotKey ? { taskSlotKey: options.taskSlotKey } : {})
+    });
     await loadBootstrap();
     if (state.activePage === 'calendar') await loadCalendar();
     toast(`${routine.title} completed. Nice work.`);
@@ -1093,7 +1095,7 @@ function openCalendarEvent(event) {
   const dateWrap = $('#calendarActionDate').closest('.date-entry-wrap') || $('#calendarActionDate');
   dateWrap.hidden = !canEditDate;
   $('#calendarEventComplete').hidden = !isDue;
-  $('#calendarEventComplete').disabled = (isDue && event.available === false) || isGoogle;
+  $('#calendarEventComplete').disabled = isGoogle;
   $('#calendarEventComplete').innerHTML = '<span aria-hidden="true">✓</span>';
   $('#calendarEventComplete').setAttribute('aria-label', 'Mark routine complete');
   $('#calendarEventComplete').title = 'Mark complete';
@@ -1131,8 +1133,9 @@ async function completeCalendarEvent() {
   const event = state.selectedCalendarEvent;
   if (!event?.routineId) return;
   const id = event.routineId;
+  const taskSlotKey = event.taskSlotKey;
   closeCalendarEvent();
-  await completeRoutine(id);
+  await completeRoutine(id, { taskSlotKey });
 }
 async function deleteCalendarActivity() {
   const event = state.selectedCalendarEvent;
