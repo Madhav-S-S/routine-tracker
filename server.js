@@ -753,16 +753,27 @@ function applyRemoteGoogleTaskUpdate(userId, account, localTask, remote, changed
     const completedAt = toIso(remote.completed, toIso(remote.updated, nowIso()));
     const frequencyPeriodStart = routine.type === 'frequency'
       ? frequencyPeriodStartFromTaskSlot(localTask.slot_key) : null;
+    const frequencyBounds = frequencyPeriodStart
+      ? routinePeriodInstants(getCurrentPeriod(routine, routineLocalMidnight(frequencyPeriodStart)))
+      : null;
     let completionId = localTask.completion_id;
     let existingCompletion = completionId
       ? db.prepare('SELECT id,completed_at,frequency_period_start FROM completions WHERE id=? AND user_id=?').get(completionId, userId)
       : null;
 
     if (!existingCompletion) {
-      const possibleMatch = db.prepare(`SELECT id,completed_at,frequency_period_start FROM completions
-        WHERE routine_id=? AND (frequency_period_start=? OR frequency_period_start IS NULL)
-        ORDER BY ABS(strftime('%s',completed_at)-strftime('%s',?)) LIMIT 1`)
-        .get(routine.id, frequencyPeriodStart, completedAt);
+      const possibleMatch = frequencyBounds
+        ? db.prepare(`SELECT id,completed_at,frequency_period_start FROM completions
+            WHERE routine_id=? AND (
+              frequency_period_start=?
+              OR (frequency_period_start IS NULL AND completed_at>=? AND completed_at<?)
+            )
+            ORDER BY ABS(strftime('%s',completed_at)-strftime('%s',?)) LIMIT 1`)
+          .get(routine.id, frequencyPeriodStart, frequencyBounds.start.toISOString(),
+            frequencyBounds.end.toISOString(), completedAt)
+        : db.prepare(`SELECT id,completed_at,frequency_period_start FROM completions
+            WHERE routine_id=? ORDER BY ABS(strftime('%s',completed_at)-strftime('%s',?)) LIMIT 1`)
+          .get(routine.id, completedAt);
       if (possibleMatch && Math.abs(new Date(possibleMatch.completed_at).getTime() - new Date(completedAt).getTime()) <= 5 * 60 * 1000) {
         completionId = possibleMatch.id;
         existingCompletion = possibleMatch;
