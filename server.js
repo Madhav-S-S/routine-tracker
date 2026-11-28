@@ -1183,12 +1183,18 @@ async function syncRoutineCompletionHistory(userId, account, tasks, selectedIds,
       await tasks.tasks.patch({ tasklist: '@default', task: taskId, requestBody });
     }
 
-    if (status !== 'completed') {
+    const remoteDueDate = remoteTask?.due ? isoDateOnly(remoteTask.due) : null;
+    const mappedDueDate = mapped?.due_date || null;
+    if (status !== 'completed' || mappedDueDate !== dueDate || (remoteTask && remoteDueDate !== dueDate)) {
       try {
         const patched = await tasks.tasks.patch({
           tasklist: '@default',
           task: taskId,
-          requestBody: { status: 'completed', completed: completion.completed_at }
+          requestBody: {
+            status: 'completed',
+            completed: completion.completed_at,
+            due: `${dueDate}T00:00:00.000Z`
+          }
         });
         remoteUpdatedAt = toIso(patched.data?.updated, remoteUpdatedAt);
         status = 'completed';
@@ -1472,24 +1478,28 @@ function queueTaskPullSync(userId) {
   taskPullQueues.set(userId, timer);
 }
 
-async function completeCurrentGoogleTask(userId, routine, slotKey = null) {
+async function completeCurrentGoogleTask(userId, routine, slotKey = null, completedAt = nowIso()) {
   const account = getCurrentGoogleAccount(userId);
   if (!account) return;
   const row = slotKey
     ? db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=? AND status='needsAction'").get(account.account_key, routine.id, slotKey)
     : db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='needsAction' ORDER BY updated_at DESC LIMIT 1").get(account.account_key, routine.id);
   if (!row) return;
-  // Mark the Google Task completed rather than deleting it. This preserves
-  // the completion in Google Calendar while the next due reminder is created.
-  const completedAt = nowIso();
+  // Keep the completed Google Task as history, and put it on the actual
+  // completion date so Google Calendar matches Routine Tracker's activity.
+  const completionDate = routineDateOnly(completedAt);
   const patched = await tasksApi(account.account_key).tasks.patch({
     tasklist: '@default',
     task: row.task_id,
-    requestBody: { status: 'completed', completed: completedAt }
+    requestBody: {
+      status: 'completed',
+      completed: completedAt,
+      due: `${completionDate}T00:00:00.000Z`
+    }
   });
-  db.prepare('UPDATE google_tasks SET status=?,remote_updated_at=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
-    .run('completed', toIso(patched.data?.updated, null), nowIso(), account.account_key, routine.id, row.slot_key);
-  return { ...row, account_key: account.account_key };
+  db.prepare('UPDATE google_tasks SET status=?,due_date=?,remote_updated_at=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
+    .run('completed', completionDate, toIso(patched.data?.updated, null), nowIso(), account.account_key, routine.id, row.slot_key);
+  return { ...row, due_date: completionDate, account_key: account.account_key };
 }
 
 function publicRoutine(routine, now = new Date(), context = null) {
@@ -2418,11 +2428,11 @@ app.post('/api/routines/:id/complete', async (req, res) => {
     }
 
     const completionSlotKey = requestedSlotKey || publicBefore.taskSlotKey;
+    const completedAt = toIso(req.body.completedAt, nowIso());
     let completedGoogleTask = null;
     try {
-      completedGoogleTask = await completeCurrentGoogleTask(req.userId, routine, completionSlotKey);
+      completedGoogleTask = await completeCurrentGoogleTask(req.userId, routine, completionSlotKey, completedAt);
     } catch (error) { console.warn('Could not complete Google Task:', error.message); }
-    const completedAt = toIso(req.body.completedAt, nowIso());
     const completionId = makeId('done');
     db.prepare('INSERT INTO completions(id,routine_id,user_id,completed_at,note,frequency_period_start) VALUES(?,?,?,?,?,?)')
       .run(completionId, routine.id, req.userId, completedAt,
