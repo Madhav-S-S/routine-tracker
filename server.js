@@ -30,6 +30,7 @@ const TASK_SYNC_BOOTSTRAP_COOLDOWN_MS = Math.max(120000, Number(process.env.TASK
 const TASK_MONTH_CACHE_MS = Math.max(60000, Number(process.env.TASK_MONTH_CACHE_MS || 180000));
 const MANUAL_TASK_SYNC_INTERVAL_MS = Math.max(60000, Number(process.env.MANUAL_TASK_SYNC_INTERVAL_MS || 900000));
 const ROUTINE_TASK_FULL_PUBLISH_COOLDOWN_MS = Math.max(60000, Number(process.env.ROUTINE_TASK_FULL_PUBLISH_COOLDOWN_MS || 180000));
+const TASK_FULL_RECONCILE_INTERVAL_MS = Math.max(300000, Number(process.env.TASK_FULL_RECONCILE_INTERVAL_MS || 1800000));
 const DATABASE_BACKUP_INTERVAL_MS = Math.max(60000, Number(process.env.DATABASE_BACKUP_INTERVAL_MS || 300000));
 // Routine dates are date-based, while Google reports task completion timestamps
 // as UTC instants. Use the user's local calendar date when computing the next
@@ -160,6 +161,7 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_completions_routine_date ON completions(routine_id, completed_at);
   CREATE INDEX IF NOT EXISTS idx_google_events_account_start ON google_events(account_key, start_at);
   CREATE INDEX IF NOT EXISTS idx_google_tasks_account_id ON google_tasks(account_key, task_id);
+  CREATE INDEX IF NOT EXISTS idx_google_tasks_completion ON google_tasks(account_key, routine_id, completion_id, status);
   CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 `);
 
@@ -181,6 +183,7 @@ ensureColumn('google_tasks', 'remote_updated_at', 'TEXT');
 ensureColumn('google_tasks', 'legacy_probe_done', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('google_accounts', 'last_task_sync', 'TEXT');
 ensureColumn('google_accounts', 'last_external_task_sync', 'TEXT');
+ensureColumn('google_accounts', 'last_task_full_sync', 'TEXT');
 ensureColumn('google_accounts', 'database_backup_file_id', 'TEXT');
 ensureColumn('google_accounts', 'last_database_backup', 'TEXT');
 ensureColumn('google_tasks', 'identity_marker_added', 'INTEGER NOT NULL DEFAULT 0');
@@ -1066,14 +1069,22 @@ async function syncGoogleTaskChanges(userId, account) {
     .all(account.account_key, userId);
   const localByTaskId = new Map(localRows.map((row) => [row.task_id, row]));
   const changedRoutines = new Set();
+
+  const now = Date.now();
   const lastSyncMs = Date.parse(account.last_task_sync || '') || 0;
-  // Google Tasks supports updatedMin. A small overlap protects against API
-  // indexing delay while avoiding a full list + one GET per local task every run.
-  const updatedMin = lastSyncMs
+  const lastFullSyncMs = Date.parse(account.last_task_full_sync || '') || 0;
+  const fullSnapshot = !lastFullSyncMs || now - lastFullSyncMs >= TASK_FULL_RECONCILE_INTERVAL_MS;
+
+  // Normal syncs fetch only recent changes. A complete paginated snapshot is
+  // used occasionally to find remote tasks deleted/hidden before the cursor.
+  const updatedMin = !fullSnapshot && lastSyncMs
     ? new Date(Math.max(0, lastSyncMs - 2 * 60 * 1000)).toISOString()
     : null;
   const params = {
-    tasklist: '@default', showCompleted: true, showDeleted: true, showHidden: true,
+    tasklist: '@default',
+    showCompleted: true,
+    showDeleted: true,
+    showHidden: true,
     maxResults: 100,
     fields: 'items(id,status,completed,updated,due,deleted,hidden),nextPageToken'
   };
@@ -1081,37 +1092,59 @@ async function syncGoogleTaskChanges(userId, account) {
 
   let pageToken = null;
   let remoteCount = 0;
+  const seenRemoteIds = fullSnapshot ? new Set() : null;
   do {
     const page = await tasks.tasks.list({ ...params, ...(pageToken ? { pageToken } : {}) });
     for (const remote of (page.data.items || [])) {
       if (!remote.id) continue;
       remoteCount += 1;
+      if (seenRemoteIds) seenRemoteIds.add(remote.id);
       const localTask = localByTaskId.get(remote.id);
       if (localTask) applyRemoteGoogleTaskUpdate(userId, account, localTask, remote, changedRoutines);
     }
     pageToken = page.data.nextPageToken || null;
   } while (pageToken);
 
-  // One-time recovery for mappings tombstoned by older releases. This is
-  // intentionally capped and never probes every mapped task on each sync.
-  const legacyTombstones = db.prepare(`SELECT gt.* FROM google_tasks gt
-    JOIN routines r ON r.id=gt.routine_id
-    WHERE gt.account_key=? AND r.user_id=? AND r.archived=0
-      AND gt.status='deleted' AND gt.legacy_probe_done=0
-    ORDER BY gt.updated_at ASC LIMIT 8`).all(account.account_key, userId);
-  for (const localTask of legacyTombstones) {
-    try {
-      const response = await tasks.tasks.get({ tasklist: '@default', task: localTask.task_id });
-      applyRemoteGoogleTaskUpdate(userId, account, localTask, response.data, changedRoutines);
-      db.prepare('UPDATE google_tasks SET legacy_probe_done=1 WHERE account_key=? AND task_id=?')
-        .run(account.account_key, localTask.task_id);
-    } catch (error) {
-      const status = Number(error.code || error.response?.status);
-      if (status === 404) {
-        db.prepare('UPDATE google_tasks SET legacy_probe_done=1,remote_updated_at=COALESCE(remote_updated_at,?) WHERE account_key=? AND task_id=?')
-          .run(nowIso(), account.account_key, localTask.task_id);
-      } else {
-        throw error;
+  if (fullSnapshot) {
+    // Only infer missing remote tasks when Google returned a non-empty,
+    // successfully paginated snapshot (or there were no local mappings).
+    // This avoids mass tombstoning if the account unexpectedly returns empty.
+    if (remoteCount > 0 || localRows.length === 0) {
+      const markMissing = db.prepare(`UPDATE google_tasks
+        SET status='deleted',remote_updated_at=NULL,updated_at=?
+        WHERE account_key=? AND task_id=? AND status<>'deleted'`);
+      for (const localTask of localRows) {
+        if (!seenRemoteIds.has(localTask.task_id)) {
+          markMissing.run(nowIso(), account.account_key, localTask.task_id);
+        }
+      }
+    } else {
+      console.warn(`Google Tasks full reconciliation returned no tasks for ${account.account_key}; kept existing mappings unchanged.`);
+    }
+  }
+
+  // Probe at most a few legacy tombstones per full snapshot, never one GET per
+  // mapped task during routine background sync.
+  if (fullSnapshot) {
+    const legacyTombstones = db.prepare(`SELECT gt.* FROM google_tasks gt
+      JOIN routines r ON r.id=gt.routine_id
+      WHERE gt.account_key=? AND r.user_id=? AND r.archived=0
+        AND gt.status='deleted' AND gt.legacy_probe_done=0
+      ORDER BY gt.updated_at ASC LIMIT 3`).all(account.account_key, userId);
+    for (const localTask of legacyTombstones) {
+      try {
+        const response = await tasks.tasks.get({ tasklist: '@default', task: localTask.task_id });
+        applyRemoteGoogleTaskUpdate(userId, account, localTask, response.data, changedRoutines);
+        db.prepare('UPDATE google_tasks SET legacy_probe_done=1 WHERE account_key=? AND task_id=?')
+          .run(account.account_key, localTask.task_id);
+      } catch (error) {
+        const status = Number(error.code || error.response?.status);
+        if (status === 404) {
+          db.prepare('UPDATE google_tasks SET legacy_probe_done=1,remote_updated_at=COALESCE(remote_updated_at,?) WHERE account_key=? AND task_id=?')
+            .run(nowIso(), account.account_key, localTask.task_id);
+        } else {
+          throw error;
+        }
       }
     }
   }
@@ -1124,10 +1157,19 @@ async function syncGoogleTaskChanges(userId, account) {
     // own mapped tasks. Keep the external-task cursor unchanged so it retries.
     console.warn(`Manual Google Tasks calendar sync failed for ${account.account_key}:`, error.message);
   }
+
   const syncedAt = nowIso();
-  db.prepare('UPDATE google_accounts SET last_task_sync=?,updated_at=? WHERE account_key=?')
-    .run(syncedAt, syncedAt, account.account_key);
-  return { synced: true, checked: localRows.length, received: remoteCount, changedRoutines: changedRoutines.size };
+  db.prepare(`UPDATE google_accounts
+    SET last_task_sync=?,last_task_full_sync=CASE WHEN ? THEN ? ELSE last_task_full_sync END,updated_at=?
+    WHERE account_key=?`)
+    .run(syncedAt, fullSnapshot ? 1 : 0, fullSnapshot ? syncedAt : null, syncedAt, account.account_key);
+  return {
+    synced: true,
+    fullSnapshot,
+    checked: localRows.length,
+    received: remoteCount,
+    changedRoutines: changedRoutines.size
+  };
 }
 async function syncRoutineCompletionHistory(userId, account, tasks, selectedIds, getRemoteTaskSnapshot) {
   const selected = selectedIds && selectedIds.size ? [...selectedIds] : null;
@@ -1155,9 +1197,9 @@ async function syncRoutineCompletionHistory(userId, account, tasks, selectedIds,
       )
       ${selectedClause}
     ORDER BY c.completed_at ASC
-    LIMIT ?`).all(userId, account.account_key, account.account_key, ...(selected || []), 26);
+    LIMIT ?`).all(userId, account.account_key, account.account_key, ...(selected || []), 13);
 
-  const batch = pending.slice(0, 25);
+  const batch = pending.slice(0, 12);
   let restored = 0;
   let repaired = 0;
 
@@ -1494,7 +1536,7 @@ function queueRoutineTaskHistoryContinuation(userId, routineIds = null) {
     } catch (error) {
       console.warn(`Routine completion history continuation failed for ${userId}:`, error.message);
     }
-  }, 30000);
+  }, 60000);
   if (timer.unref) timer.unref();
   routineTaskHistoryContinuationTimers.set(userId, timer);
 }
