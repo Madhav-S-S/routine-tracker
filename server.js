@@ -588,14 +588,21 @@ function frequencyPeriodStartFromTaskSlot(slotKey) {
   const date = new Date(match[1]);
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
+function frequencyPeriodKey(bounds) {
+  // Frequency completions are stored against the period's UTC date key
+  // (YYYY-MM-DDT00:00:00.000Z), not the UTC instant of local midnight.
+  // Convert the local-midnight instant back to that same date key.
+  return `${routineDateOnly(bounds.start)}T00:00:00.000Z`;
+}
 function frequencyCompletionCount(routineId, bounds) {
+  const periodKey = frequencyPeriodKey(bounds);
   const periodStart = bounds.start.toISOString();
   const periodEnd = bounds.end.toISOString();
   const row = db.prepare(`SELECT COUNT(*) AS n FROM completions
     WHERE routine_id=? AND (
-      frequency_period_start=?
+      frequency_period_start IN (?,?)
       OR (frequency_period_start IS NULL AND completed_at>=? AND completed_at<?)
-    )`).get(routineId, periodStart, periodStart, periodEnd);
+    )`).get(routineId, periodKey, periodStart, periodStart, periodEnd);
   return Number(row?.n || 0);
 }
 function nextFrequencyTask(routine, publicItem = null) {
@@ -1447,17 +1454,17 @@ function listRoutines(userId, includeArchived = false) {
   // per frequency routine.
   for (let offset = 0; offset < frequencyRows.length; offset += 200) {
     const chunk = frequencyRows.slice(offset, offset + 200);
-    const slots = chunk.map(() => '(?,?,?)').join(',');
+    const slots = chunk.map(() => '(?,?,?,?)').join(',');
     const params = chunk.flatMap(({ routine, bounds }) => [
-      routine.id, bounds.start.toISOString(), bounds.end.toISOString()
+      routine.id, frequencyPeriodKey(bounds), bounds.start.toISOString(), bounds.end.toISOString()
     ]);
-    const counts = db.prepare(`WITH period_bounds(routine_id, period_start, period_end) AS (VALUES ${slots})
+    const counts = db.prepare(`WITH period_bounds(routine_id, period_key, period_start, period_end) AS (VALUES ${slots})
       SELECT p.routine_id, COUNT(c.id) AS completion_count
       FROM period_bounds p
       LEFT JOIN completions c
         ON c.routine_id=p.routine_id
         AND (
-          c.frequency_period_start=p.period_start
+          c.frequency_period_start IN (p.period_key,p.period_start)
           OR (c.frequency_period_start IS NULL AND c.completed_at>=p.period_start AND c.completed_at<p.period_end)
         )
       GROUP BY p.routine_id`).all(...params);
