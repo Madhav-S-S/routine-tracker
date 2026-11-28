@@ -1176,11 +1176,6 @@ async function syncRoutineCompletionHistory(userId, account, tasks, selectedIds,
   if (selectedIds && !selectedIds.size) return { checked: 0, restored: 0, repaired: 0, hasMore: false };
 
   const selectedClause = selected ? `AND c.routine_id IN (${selected.map(() => '?').join(',')})` : '';
-  const params = [
-    account.account_key, account.account_key, userId,
-    ...(selected || []),
-    26
-  ];
   const pending = db.prepare(`SELECT c.id,c.routine_id,c.completed_at,c.note,r.title,r.notes
     FROM completions c
     JOIN routines r ON r.id=c.routine_id
@@ -1238,12 +1233,11 @@ async function syncRoutineCompletionHistory(userId, account, tasks, selectedIds,
       let status = 'completed';
       let remoteUpdatedAt = null;
       if (taskId) {
-        const needsRepair = !mapped || mapped.status !== 'completed' ||
-          (mapped.due_date && mapped.due_date !== dueDate) ||
-          (remoteTask && (
-            remoteTask.status !== 'completed' ||
-            (remoteTask.due && isoDateOnly(remoteTask.due) !== dueDate)
-          ));
+        const needsRepair = mapped
+          ? mapped.status !== 'completed' || mapped.due_date !== dueDate
+          : !remoteTask ||
+            (remoteTask.status !== 'completed' && !remoteTask.completed && !remoteTask.hidden) ||
+            !remoteTask.due || isoDateOnly(remoteTask.due) !== dueDate;
         if (needsRepair) {
           const patched = await tasks.tasks.patch({
             tasklist: '@default',
