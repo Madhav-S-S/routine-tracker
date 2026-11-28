@@ -161,7 +161,6 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_completions_routine_date ON completions(routine_id, completed_at);
   CREATE INDEX IF NOT EXISTS idx_google_events_account_start ON google_events(account_key, start_at);
   CREATE INDEX IF NOT EXISTS idx_google_tasks_account_id ON google_tasks(account_key, task_id);
-  CREATE INDEX IF NOT EXISTS idx_google_tasks_completion ON google_tasks(account_key, routine_id, completion_id, status);
   CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 `);
 
@@ -187,6 +186,10 @@ ensureColumn('google_accounts', 'last_task_full_sync', 'TEXT');
 ensureColumn('google_accounts', 'database_backup_file_id', 'TEXT');
 ensureColumn('google_accounts', 'last_database_backup', 'TEXT');
 ensureColumn('google_tasks', 'identity_marker_added', 'INTEGER NOT NULL DEFAULT 0');
+
+// Create this index only after in-place column migrations so older SQLite
+// databases without completion_id can still start and upgrade safely.
+db.exec('CREATE INDEX IF NOT EXISTS idx_google_tasks_completion ON google_tasks(account_key, routine_id, completion_id, status)');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS google_external_tasks (
