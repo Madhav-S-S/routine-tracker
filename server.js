@@ -1118,6 +1118,100 @@ async function syncGoogleTaskChanges(userId, account) {
     .run(syncedAt, syncedAt, account.account_key);
   return { synced: true, checked: localRows.length, received: remoteCount, changedRoutines: changedRoutines.size };
 }
+async function syncRoutineCompletionHistory(userId, account, tasks, selectedIds, getRemoteTaskSnapshot) {
+  const selected = selectedIds && selectedIds.size ? [...selectedIds] : null;
+  if (selectedIds && !selectedIds.size) return { checked: 0, restored: 0 };
+
+  const completions = selected
+    ? db.prepare(`SELECT c.id,c.routine_id,c.completed_at,c.note,r.title,r.notes
+        FROM completions c JOIN routines r ON r.id=c.routine_id
+        WHERE c.user_id=? AND c.routine_id IN (${selected.map(() => '?').join(',')})
+        ORDER BY c.completed_at`).all(userId, ...selected)
+    : db.prepare(`SELECT c.id,c.routine_id,c.completed_at,c.note,r.title,r.notes
+        FROM completions c JOIN routines r ON r.id=c.routine_id
+        WHERE c.user_id=? ORDER BY c.completed_at`).all(userId);
+
+  let restored = 0;
+  for (const completion of completions) {
+    const slotKey = `history:${completion.id}`;
+    const dueDate = routineDateOnly(completion.completed_at);
+    const requestBody = {
+      title: completion.title,
+      notes: routineTaskNotes({ id: completion.routine_id, notes: completion.notes }, slotKey),
+      due: `${dueDate}T00:00:00.000Z`
+    };
+
+    let mapped = db.prepare(`SELECT * FROM google_tasks
+      WHERE account_key=? AND routine_id=? AND (completion_id=? OR slot_key=?)
+      ORDER BY CASE WHEN completion_id=? THEN 0 ELSE 1 END LIMIT 1`)
+      .get(account.account_key, completion.routine_id, completion.id, slotKey, completion.id);
+
+    // A deliberately deleted history item should remain deleted. The missing
+    // items from the regression have no completion mapping and are restored.
+    if (mapped?.status === 'deleted') continue;
+
+    let remoteTask = null;
+    if (!mapped) {
+      const remoteTasks = await getRemoteTaskSnapshot();
+      const marker = routineTaskMarker(completion.routine_id, slotKey);
+      remoteTask = remoteTasks.find((task) => task.id && String(task.notes || '').includes(marker)) || null;
+      if (remoteTask?.deleted || remoteTask?.status === 'deleted') {
+        db.prepare(`INSERT OR IGNORE INTO google_tasks(
+          account_key,routine_id,slot_key,task_id,due_date,status,updated_at,completion_id,remote_updated_at,identity_marker_added
+        ) VALUES(?,?,?,?,?,'deleted',?,?,?,1)`)
+          .run(account.account_key, completion.routine_id, slotKey, remoteTask.id, dueDate,
+            nowIso(), completion.id, toIso(remoteTask.updated, null));
+        continue;
+      }
+    }
+
+    let taskId = mapped?.task_id || remoteTask?.id || null;
+    let remoteUpdatedAt = mapped?.remote_updated_at || toIso(remoteTask?.updated, null);
+    let status = mapped?.status || (
+      remoteTask && (remoteTask.status === 'completed' || remoteTask.completed || remoteTask.hidden)
+        ? 'completed' : 'needsAction'
+    );
+
+    if (!taskId) {
+      const created = await tasks.tasks.insert({ tasklist: '@default', requestBody });
+      taskId = created.data.id;
+      remoteUpdatedAt = toIso(created.data?.updated, null);
+      status = 'needsAction';
+      if (remoteTaskSnapshot) remoteTaskSnapshot.push(created.data);
+    } else if (remoteTask && !String(remoteTask.notes || '').includes(routineTaskMarker(completion.routine_id, slotKey))) {
+      // Keep the stable history marker on any recovered task mapping.
+      await tasks.tasks.patch({ tasklist: '@default', task: taskId, requestBody });
+    }
+
+    if (status !== 'completed') {
+      try {
+        const patched = await tasks.tasks.patch({
+          tasklist: '@default',
+          task: taskId,
+          requestBody: { status: 'completed', completed: completion.completed_at }
+        });
+        remoteUpdatedAt = toIso(patched.data?.updated, remoteUpdatedAt);
+        status = 'completed';
+      } catch (error) {
+        // Leave a mapped needsAction row so the next sync retries the completion.
+        console.warn(`Could not restore completed Google Task for "${completion.title}" (${dueDate}):`, error.message);
+      }
+    }
+
+    db.prepare(`INSERT INTO google_tasks(
+      account_key,routine_id,slot_key,task_id,due_date,status,updated_at,completion_id,remote_updated_at,identity_marker_added
+    ) VALUES(?,?,?,?,?,?,?,?,?,1)
+    ON CONFLICT(account_key,routine_id,slot_key) DO UPDATE SET
+      task_id=excluded.task_id,due_date=excluded.due_date,status=excluded.status,
+      updated_at=excluded.updated_at,completion_id=excluded.completion_id,
+      remote_updated_at=excluded.remote_updated_at,identity_marker_added=1`)
+      .run(account.account_key, completion.routine_id, slotKey, taskId, dueDate, status,
+        nowIso(), completion.id, remoteUpdatedAt || null);
+    if (!mapped) restored++;
+  }
+  return { checked: completions.length, restored };
+}
+
 async function syncRoutineTasks(userId, routineIds = null, options = {}) {
   if (!driveRestoreReadyUsers.has(userId)) return { skipped: true, reason: 'Drive restore is not complete' };
   if (taskSyncLocks.has(userId)) return { skipped: true, reason: 'sync already running' };
@@ -1188,7 +1282,9 @@ async function syncRoutineTasks(userId, routineIds = null, options = {}) {
           WHERE account_key=? AND routine_id=? AND status<>'deleted'`)
           .all(account.account_key, routine.id);
         for (const staleTask of staleTasks) {
-          if (keepSlotKeys.has(staleTask.slot_key)) continue;
+          // Completed tasks are history, not obsolete reminders. Keep them in
+          // Google Tasks/Calendar even after the routine advances to a new date.
+          if (keepSlotKeys.has(staleTask.slot_key) || staleTask.status === 'completed') continue;
           try {
             await deleteGoogleTask(account.account_key, staleTask.task_id);
             db.prepare("UPDATE google_tasks SET status='deleted',completion_id=NULL,remote_updated_at=NULL,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
@@ -1304,8 +1400,18 @@ async function syncRoutineTasks(userId, routineIds = null, options = {}) {
       mappingsChanged = true;
       }
     }
+    // Mirror local completion history into Google Tasks so Google Calendar
+    // retains completed routine entries, including rows whose old task was
+    // deleted by the previous interval-completion behavior.
+    const historySync = await syncRoutineCompletionHistory(
+      userId, account, tasks, selectedIds, getRemoteTaskSnapshot
+    );
+    if (historySync.restored) {
+      console.log(`Restored ${historySync.restored} routine completion(s) to Google Tasks for ${userId}.`);
+      mappingsChanged = true;
+    }
     if (mappingsChanged) queueDriveSync(userId);
-    return { synced: true, mappingsUpdated: mappingsChanged };
+    return { synced: true, mappingsUpdated: mappingsChanged, history: historySync };
   } finally {
     taskSyncLocks.delete(userId);
   }
@@ -1373,21 +1479,14 @@ async function completeCurrentGoogleTask(userId, routine, slotKey = null) {
     ? db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=? AND status='needsAction'").get(account.account_key, routine.id, slotKey)
     : db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='needsAction' ORDER BY updated_at DESC LIMIT 1").get(account.account_key, routine.id);
   if (!row) return;
-
-  if (routine.type === 'interval') {
-    // A repeat-after task is a reminder for one due date, not a recurring
-    // Google Calendar history entry. Completing it replaces that reminder
-    // with the next due date, so remove the old Google Task entirely.
-    await deleteGoogleTask(account.account_key, row.task_id);
-    const stamp = nowIso();
-    db.prepare("UPDATE google_tasks SET status='deleted',completion_id=NULL,remote_updated_at=NULL,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
-      .run(stamp, account.account_key, routine.id, row.slot_key);
-    db.prepare('DELETE FROM google_external_tasks WHERE account_key=? AND task_id=?')
-      .run(account.account_key, row.task_id);
-    return null;
-  }
-
-  const patched = await tasksApi(account.account_key).tasks.patch({ tasklist: '@default', task: row.task_id, requestBody: { status: 'completed', completed: nowIso() } });
+  // Mark the Google Task completed rather than deleting it. This preserves
+  // the completion in Google Calendar while the next due reminder is created.
+  const completedAt = nowIso();
+  const patched = await tasksApi(account.account_key).tasks.patch({
+    tasklist: '@default',
+    task: row.task_id,
+    requestBody: { status: 'completed', completed: completedAt }
+  });
   db.prepare('UPDATE google_tasks SET status=?,remote_updated_at=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
     .run('completed', toIso(patched.data?.updated, null), nowIso(), account.account_key, routine.id, row.slot_key);
   return { ...row, account_key: account.account_key };
