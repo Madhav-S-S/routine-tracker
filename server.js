@@ -749,9 +749,11 @@ function applyRemoteGoogleTaskUpdate(userId, account, localTask, remote, changed
   // republished as a visible task rather than silently disappearing.
   const remoteState = (remote.deleted || remote.status === 'deleted')
     ? 'deleted'
-    : (remote.status === 'completed' || Boolean(remote.completed) || remote.hidden === true)
-      ? 'completed'
-      : remote.status === 'needsAction' ? 'needsAction' : null;
+    : remote.hidden === true
+      ? 'hidden'
+      : (remote.status === 'completed' || Boolean(remote.completed))
+        ? 'completed'
+        : remote.status === 'needsAction' ? 'needsAction' : null;
   if (!remoteState) return;
 
   const incomingTime = Date.parse(remoteUpdatedAt || '') || 0;
@@ -768,7 +770,7 @@ function applyRemoteGoogleTaskUpdate(userId, account, localTask, remote, changed
     return;
   }
 
-  if (remoteState === 'completed') {
+  if (remoteState === 'completed' || remoteState === 'hidden') {
     if (localTask.status === 'deleted') {
       db.prepare('DELETE FROM routine_task_suppressions WHERE user_id=? AND routine_id=? AND slot_key=?')
         .run(userId, routine.id, localTask.slot_key);
@@ -822,8 +824,12 @@ function applyRemoteGoogleTaskUpdate(userId, account, localTask, remote, changed
       completionId = null;
     }
 
-    db.prepare("UPDATE google_tasks SET status='completed',completion_id=COALESCE(?,completion_id),due_date=?,remote_updated_at=COALESCE(?,remote_updated_at),updated_at=? WHERE account_key=? AND task_id=?")
-      .run(completionId, remoteDueDate, remoteUpdatedAt, nowIso(), account.account_key, localTask.task_id);
+    // Google marks tasks hidden after the user clears completed tasks.
+    // Keep the local completion, but retire that hidden remote ID so the
+    // history publisher can create a visible completed copy for Calendar.
+    const nextMappedStatus = remoteState === 'hidden' ? 'deleted' : 'completed';
+    db.prepare("UPDATE google_tasks SET status=?,completion_id=COALESCE(?,completion_id),due_date=?,remote_updated_at=COALESCE(?,remote_updated_at),updated_at=? WHERE account_key=? AND task_id=?")
+      .run(nextMappedStatus, completionId, remoteDueDate, remoteUpdatedAt, nowIso(), account.account_key, localTask.task_id);
     return;
   }
 
@@ -1597,7 +1603,7 @@ async function completeCurrentGoogleTask(userId, routine, slotKey = null, comple
   if (!account) return;
   const row = slotKey
     ? db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=? AND status<>'deleted'").get(account.account_key, routine.id, slotKey)
-    : db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status<>'deleted' ORDER BY updated_at DESC LIMIT 1").get(account.account_key, routine.id);
+    : db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='needsAction' ORDER BY updated_at DESC LIMIT 1").get(account.account_key, routine.id);
   if (!row) return;
 
   // Keep the original mapped task and attach the local completion before
