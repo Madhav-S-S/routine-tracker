@@ -1158,11 +1158,15 @@ async function syncRoutineTasks(userId, routineIds = null, options = {}) {
     for (const routine of routines) {
       const desiredSlots = [];
       if (routine.type === 'interval' && routine.next_due_at) {
-        if (routine.linked_to_routine_id && (
-          routine.linked_completed_anchor === routine.next_due_at ||
-          (routine.last_completed_at && new Date(routine.last_completed_at).getTime() >= new Date(routine.next_due_at).getTime())
-        )) continue;
-        desiredSlots.push({ dueDate: routineDateOnly(routine.next_due_at), slotKey: routineTaskSlotKey(routine) });
+        const currentOccurrenceCompleted = Boolean(
+          routine.linked_to_routine_id && (
+            routine.linked_completed_anchor === routine.next_due_at ||
+            (routine.last_completed_at && new Date(routine.last_completed_at).getTime() >= new Date(routine.next_due_at).getTime())
+          )
+        );
+        if (!currentOccurrenceCompleted) {
+          desiredSlots.push({ dueDate: routineDateOnly(routine.next_due_at), slotKey: routineTaskSlotKey(routine) });
+        }
       } else if (routine.type === 'frequency') {
         if (!routine.maximumReached && routine.nextOpportunityAt) {
           desiredSlots.push({
@@ -1172,6 +1176,30 @@ async function syncRoutineTasks(userId, routineIds = null, options = {}) {
         }
         const nextTask = nextFrequencyTask(routine, routine);
         if (nextTask) desiredSlots.push(nextTask);
+      }
+
+      if (routine.type === 'interval') {
+        // An interval routine can have only one live reminder. When its due
+        // date moves (for example, after a late completion), retire every old
+        // mapped occurrence instead of leaving an obsolete task in Google
+        // Calendar alongside the newly scheduled reminder.
+        const keepSlotKeys = new Set(desiredSlots.map((slot) => slot.slotKey).filter(Boolean));
+        const staleTasks = db.prepare(`SELECT * FROM google_tasks
+          WHERE account_key=? AND routine_id=? AND status<>'deleted'`)
+          .all(account.account_key, routine.id);
+        for (const staleTask of staleTasks) {
+          if (keepSlotKeys.has(staleTask.slot_key)) continue;
+          try {
+            await deleteGoogleTask(account.account_key, staleTask.task_id);
+            db.prepare("UPDATE google_tasks SET status='deleted',completion_id=NULL,remote_updated_at=NULL,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
+              .run(nowIso(), account.account_key, routine.id, staleTask.slot_key);
+            db.prepare('DELETE FROM google_external_tasks WHERE account_key=? AND task_id=?')
+              .run(account.account_key, staleTask.task_id);
+            mappingsChanged = true;
+          } catch (error) {
+            console.warn(`Could not remove an obsolete Google Task for routine "${routine.title}":`, error.message);
+          }
+        }
       }
 
       for (const desired of desiredSlots) {
@@ -1345,6 +1373,20 @@ async function completeCurrentGoogleTask(userId, routine, slotKey = null) {
     ? db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=? AND status='needsAction'").get(account.account_key, routine.id, slotKey)
     : db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='needsAction' ORDER BY updated_at DESC LIMIT 1").get(account.account_key, routine.id);
   if (!row) return;
+
+  if (routine.type === 'interval') {
+    // A repeat-after task is a reminder for one due date, not a recurring
+    // Google Calendar history entry. Completing it replaces that reminder
+    // with the next due date, so remove the old Google Task entirely.
+    await deleteGoogleTask(account.account_key, row.task_id);
+    const stamp = nowIso();
+    db.prepare("UPDATE google_tasks SET status='deleted',completion_id=NULL,remote_updated_at=NULL,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
+      .run(stamp, account.account_key, routine.id, row.slot_key);
+    db.prepare('DELETE FROM google_external_tasks WHERE account_key=? AND task_id=?')
+      .run(account.account_key, row.task_id);
+    return null;
+  }
+
   const patched = await tasksApi(account.account_key).tasks.patch({ tasklist: '@default', task: row.task_id, requestBody: { status: 'completed', completed: nowIso() } });
   db.prepare('UPDATE google_tasks SET status=?,remote_updated_at=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
     .run('completed', toIso(patched.data?.updated, null), nowIso(), account.account_key, routine.id, row.slot_key);
