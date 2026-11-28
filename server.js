@@ -747,9 +747,9 @@ function applyRemoteGoogleTaskUpdate(userId, account, localTask, remote, changed
   // Hidden tasks have been cleared from the user's first-party task list.
   // Treat them like missing tasks so locally-owned completion history can be
   // republished as a visible task rather than silently disappearing.
-  const remoteState = (remote.deleted || remote.status === 'deleted' || remote.hidden === true)
+  const remoteState = (remote.deleted || remote.status === 'deleted')
     ? 'deleted'
-    : (remote.status === 'completed' || Boolean(remote.completed))
+    : (remote.status === 'completed' || Boolean(remote.completed) || remote.hidden === true)
       ? 'completed'
       : remote.status === 'needsAction' ? 'needsAction' : null;
   if (!remoteState) return;
