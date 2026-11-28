@@ -25,8 +25,8 @@ const DRIVE_AUTO_SYNC = String(process.env.DRIVE_AUTO_SYNC || 'true').toLowerCas
 const DRIVE_RESTORE_ON_STARTUP = String(process.env.DRIVE_RESTORE_ON_STARTUP || 'true').toLowerCase() !== 'false';
 const DRIVE_AUTO_SYNC_DELAY_MS = Math.max(15000, Number(process.env.DRIVE_AUTO_SYNC_DELAY_MS || 30000));
 const CALENDAR_SYNC_INTERVAL_MS = Number(process.env.CALENDAR_SYNC_INTERVAL_MS || 300000);
-const TASK_SYNC_INTERVAL_MS = Math.max(120000, Number(process.env.TASK_SYNC_INTERVAL_MS || 300000));
-const TASK_SYNC_BOOTSTRAP_COOLDOWN_MS = Math.max(120000, Number(process.env.TASK_SYNC_BOOTSTRAP_COOLDOWN_MS || 180000));
+const TASK_SYNC_INTERVAL_MS = Math.max(120000, Number(process.env.TASK_SYNC_INTERVAL_MS || 120000));
+const TASK_SYNC_BOOTSTRAP_COOLDOWN_MS = Math.max(120000, Number(process.env.TASK_SYNC_BOOTSTRAP_COOLDOWN_MS || 120000));
 const TASK_MONTH_CACHE_MS = Math.max(60000, Number(process.env.TASK_MONTH_CACHE_MS || 180000));
 const MANUAL_TASK_SYNC_INTERVAL_MS = Math.max(60000, Number(process.env.MANUAL_TASK_SYNC_INTERVAL_MS || 900000));
 const ROUTINE_TASK_FULL_PUBLISH_COOLDOWN_MS = Math.max(60000, Number(process.env.ROUTINE_TASK_FULL_PUBLISH_COOLDOWN_MS || 180000));
