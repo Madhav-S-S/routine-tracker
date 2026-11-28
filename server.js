@@ -1592,28 +1592,44 @@ function queueTaskPullSync(userId) {
   taskPullQueues.set(userId, timer);
 }
 
-async function completeCurrentGoogleTask(userId, routine, slotKey = null, completedAt = nowIso()) {
+async function completeCurrentGoogleTask(userId, routine, slotKey = null, completedAt = nowIso(), completionId = null) {
   const account = getCurrentGoogleAccount(userId);
   if (!account) return;
   const row = slotKey
-    ? db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=? AND status='needsAction'").get(account.account_key, routine.id, slotKey)
-    : db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status='needsAction' ORDER BY updated_at DESC LIMIT 1").get(account.account_key, routine.id);
+    ? db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND slot_key=? AND status<>'deleted'").get(account.account_key, routine.id, slotKey)
+    : db.prepare("SELECT * FROM google_tasks WHERE account_key=? AND routine_id=? AND status<>'deleted' ORDER BY updated_at DESC LIMIT 1").get(account.account_key, routine.id);
   if (!row) return;
-  // Keep the completed Google Task as history, and put it on the actual
-  // completion date so Google Calendar matches Routine Tracker's activity.
+
+  // Keep the original mapped task and attach the local completion before
+  // making the network request. If Google is temporarily unavailable, the
+  // next sync can retry this exact task instead of creating a duplicate.
   const completionDate = routineDateOnly(completedAt);
-  const patched = await tasksApi(account.account_key).tasks.patch({
-    tasklist: '@default',
-    task: row.task_id,
-    requestBody: {
-      status: 'completed',
-      completed: completedAt,
-      due: `${completionDate}T00:00:00.000Z`
-    }
-  });
-  db.prepare('UPDATE google_tasks SET status=?,due_date=?,remote_updated_at=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
-    .run('completed', completionDate, toIso(patched.data?.updated, null), nowIso(), account.account_key, routine.id, row.slot_key);
-  return { ...row, due_date: completionDate, account_key: account.account_key };
+  const pendingStamp = nowIso();
+  db.prepare("UPDATE google_tasks SET completion_id=COALESCE(?,completion_id),due_date=?,status='needsAction',updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?")
+    .run(completionId, completionDate, pendingStamp, account.account_key, routine.id, row.slot_key);
+
+  try {
+    const patched = await tasksApi(account.account_key).tasks.patch({
+      tasklist: '@default',
+      task: row.task_id,
+      requestBody: {
+        status: 'completed',
+        completed: completedAt,
+        due: `${completionDate}T00:00:00.000Z`
+      }
+    });
+    const remoteStatus = patched.data?.status || 'completed';
+    db.prepare('UPDATE google_tasks SET status=?,due_date=?,remote_updated_at=?,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
+      .run(remoteStatus, completionDate, toIso(patched.data?.updated, null), nowIso(), account.account_key, routine.id, row.slot_key);
+    return { ...row, due_date: completionDate, completion_id: completionId || row.completion_id, account_key: account.account_key };
+  } catch (error) {
+    const statusCode = Number(error.code || error.response?.status);
+    const localStatus = statusCode === 404 ? 'deleted' : 'needsAction';
+    db.prepare('UPDATE google_tasks SET status=?,completion_id=COALESCE(?,completion_id),remote_updated_at=CASE WHEN ? THEN NULL ELSE remote_updated_at END,updated_at=? WHERE account_key=? AND routine_id=? AND slot_key=?')
+      .run(localStatus, completionId, statusCode === 404 ? 1 : 0, nowIso(), account.account_key, routine.id, row.slot_key);
+    console.warn(`Google Task completion will be retried during the next sync for "${routine.title}":`, error.message);
+    return { ...row, status: localStatus, due_date: completionDate, completion_id: completionId || row.completion_id, account_key: account.account_key };
+  }
 }
 
 function publicRoutine(routine, now = new Date(), context = null) {
@@ -2543,11 +2559,13 @@ app.post('/api/routines/:id/complete', async (req, res) => {
 
     const completionSlotKey = requestedSlotKey || publicBefore.taskSlotKey;
     const completedAt = toIso(req.body.completedAt, nowIso());
+    const completionId = makeId('done');
     let completedGoogleTask = null;
     try {
-      completedGoogleTask = await completeCurrentGoogleTask(req.userId, routine, completionSlotKey, completedAt);
+      completedGoogleTask = await completeCurrentGoogleTask(
+        req.userId, routine, completionSlotKey, completedAt, completionId
+      );
     } catch (error) { console.warn('Could not complete Google Task:', error.message); }
-    const completionId = makeId('done');
     db.prepare('INSERT INTO completions(id,routine_id,user_id,completed_at,note,frequency_period_start) VALUES(?,?,?,?,?,?)')
       .run(completionId, routine.id, req.userId, completedAt,
         String(req.body.note || '').slice(0, 500), frequencyPeriodStart);
